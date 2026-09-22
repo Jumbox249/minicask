@@ -142,19 +142,58 @@ Concurrency is a mutex. The store is single-threaded by design, so each connecti
 
 `src/resp.rs` is both halves of the protocol, and `minicask::resp::read_reply` is what the test suite uses as a client.
 
+## Raft
+
+A single server is one disk and one power supply. `minicask::raft` is leader election and log replication across a set of nodes, so that a majority surviving is enough.
+
+The consensus layer is a state machine and nothing else. It owns no threads, opens no sockets and reads no clock:
+
+```rust
+use minicask::raft::{Config, MemStorage, Node};
+
+let mut node = Node::new(1, vec![1, 2, 3], Config::default(), MemStorage::new());
+let actions = node.tick()?;        // time passes
+let actions = node.step(2, msg)?;  // a message arrives
+// each hands back the messages to send; the caller owns the sockets
+```
+
+That shape is the point rather than a matter of taste. Consensus bugs are timing bugs, and a timing bug is only reproducible if the test owns the timing. `tests/raft.rs` drives whole clusters through network partitions, leader kills and restarts with no sleeps and no threads, so a failure reproduces exactly, at the same tick, every run.
+
+What it implements: elections with randomised timeouts, log replication with the term-matching induction, the up-to-date check that decides a vote, conflict backoff by term rather than one entry per round trip, and the no-op a leader appends on taking office so that entries from earlier terms become committable.
+
+### What the tests actually prove
+
+Nineteen cluster scenarios and thirteen protocol tests, including the ones a naive implementation passes and should not:
+
+- **`a_stale_candidate_cannot_win_even_with_the_highest_term`** isolates a node until it has missed six committed entries and campaigned its term far above everyone else's, then heals the network with nothing in flight and makes it stand for election. Its term is high enough to depose the leader. Its log is not good enough to replace it, and the votes have to say so.
+- **`a_deposed_leader_steps_down_and_drops_its_orphan_entries`** feeds commands to a leader that has been cut off from everyone, then heals and requires those entries to be overwritten rather than applied.
+- **`commands_survive_relentless_churn`** runs twelve rounds of commit-then-break-something, checking after every round that no two nodes disagree about any index.
+- **`a_stale_append_does_not_shorten_the_log`** delivers a late duplicate that mentions fewer entries than the follower holds, and requires the extra ones to survive. Deleting what a message merely failed to mention is the classic way to lose a committed entry.
+
+A test suite that passes proves nothing on its own, so the safety rules were checked by breaking them on purpose. Removing the up-to-date check from voting, truncating the log on every append, trusting the leader's commit index, or allowing two votes in one term each fail the suite.
+
+One mutation does *not* fail it, which is worth saying plainly: dropping the rule that a leader may only commit entries from its own term. That rule is unreachable here, because `next_index` is set before the leader appends its no-op, so every `AppendEntries` it ever sends includes that no-op, and a successful reply therefore always reports a match at or past it. The check stays as defence in depth for the day that stops being true.
+
+### What it does not do yet
+
+- **Storage is in memory.** The `Storage` trait is the seam, and the test harness models a crash honestly by dropping the node and keeping the storage. Backing it with the append-only files this repository already has is the next piece of work.
+- **Nothing is wired to the store.** The consensus layer moves opaque bytes; making `SET` and `DEL` into replicated commands is what turns this into a replicated database rather than a Raft implementation sitting beside one.
+- **No snapshots**, so a log grows forever and a node that falls far enough behind is caught up an entry at a time.
+- **Fixed membership.** Adding or removing a node means restarting the cluster.
+
 ## Testing
 
 ```console
 $ cargo test
 ```
 
-47 tests, including the three that matter:
+78 tests, including the three that matter:
 
 - **`a_killed_writer_loses_nothing_it_finished`** spawns a real child process that writes 500 records, scribbles a header with no body onto the end of the file, then calls `abort()`. No destructor runs, no buffer is flushed, the kernel takes the process out with `SIGABRT`. The test then reopens the store and checks all 500 records, and that it is still writable afterwards.
 - **`corruption_in_a_sealed_file_is_reported`** flips a bit in a file that was already closed and asserts the store refuses to open rather than pretending.
 - **`deleted_keys_do_not_come_back_after_a_compaction`** guards the ordering rule that makes compaction safe.
 
-`tests/server.rs` starts the real `minicask-server` binary and talks to it over a socket: pipelining, inline commands, binary-safe values, eight clients writing at once, a protocol error that must not affect other connections, and a `kill` followed by a restart on the same directory.
+`tests/raft.rs` is a deterministic cluster harness, described above. `tests/server.rs` starts the real `minicask-server` binary and talks to it over a socket: pipelining, inline commands, binary-safe values, eight clients writing at once, a protocol error that must not affect other connections, and a `kill` followed by a restart on the same directory.
 
 ## Layout
 
@@ -165,6 +204,7 @@ src/log.rs      data files, the append writer, the recovery scanner
 src/store.rs    the index, the read path, recovery, compaction
 src/resp.rs     the Redis wire protocol, both directions
 src/server.rs   the TCP server and its command table
+src/raft/       consensus: the log, the RPCs, the state machine
 src/bin/        the CLI, the server, and the crash-test helper
 ```
 
