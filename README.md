@@ -113,7 +113,7 @@ reclaimable  0 (0.0%)
 
 ## Redis-compatible server
 
-`minicask-server` puts the store behind a TCP port speaking RESP, the Redis wire protocol. The official `redis-cli` and the ordinary client libraries connect to it without knowing the difference.
+`minicask-server` puts the store behind a TCP port speaking RESP, the Redis wire protocol. The official `redis-cli` and the ordinary client libraries connect to it without knowing the difference. Verified against `redis-cli` 7.4.11, which needs no flags and no shim:
 
 ```console
 $ minicask-server --dir ./data
@@ -125,13 +125,18 @@ $ redis-cli SET greeting "hello world"
 OK
 $ redis-cli GET greeting
 "hello world"
+$ redis-cli MSET user:1 ann user:2 bob
+OK
+$ redis-cli KEYS 'user:*'
+1) "user:1"
+2) "user:2"
 $ redis-cli DBSIZE
-(integer) 1
+(integer) 3
 ```
 
 The commands it answers: `GET`, `SET` (with `NX` and `XX`), `MGET`, `MSET`, `DEL`, `EXISTS`, `KEYS`, `DBSIZE`, `FLUSHDB`, `PING`, `ECHO`, `SELECT 0`, `QUIT`, and enough of `COMMAND` and `CLIENT` for clients to finish their handshake. `SET` with an expiry is refused with a syntax error rather than accepted and forgotten, since the store has no clock to honour it with.
 
-Pipelining works: replies to a batch of commands go out in one write. Inline commands (`GET greeting` on a bare line) work too, so `telnet` and `nc` are enough to poke at it. A protocol error closes that one connection and no other.
+Pipelining works, including `redis-cli --pipe`: replies to a batch of commands go out in one write. Inline commands (`GET greeting` on a bare line) work too, so `telnet` and `nc` are enough to poke at it. A protocol error closes that one connection and no other.
 
 Concurrency is a mutex. The store is single-threaded by design, so each connection gets a thread and each command takes the lock for exactly one read or one append. That is the simplest correct thing, and it means the server's write throughput is the store's: 4.5k/sec with fsync on every write, 100x that with `--no-fsync`.
 
