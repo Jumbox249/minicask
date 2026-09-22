@@ -532,7 +532,7 @@ mod tests {
     /// A node whose storage holds `snapshot`, joined to `store`, which
     /// makes `new` restore the store to it.
     fn restored(store: Store, snapshot: &[u8]) -> ReplicatedStore<crate::raft::MemStorage> {
-        use crate::raft::{Config, MemStorage, SnapshotMeta, Storage};
+        use crate::raft::{Config, MemStorage, SnapshotMeta};
         let mut storage = MemStorage::new();
         storage
             .save_snapshot(SnapshotMeta { index: 5, term: 1 }, snapshot)
