@@ -3,7 +3,7 @@
 
 mod common;
 
-use caskdb::{Options, Store};
+use minicask::{Options, Store};
 use common::TempDir;
 
 #[test]

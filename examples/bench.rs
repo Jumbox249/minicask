@@ -4,16 +4,16 @@
 //!
 //! Run with: `cargo run --release --example bench`
 
-use caskdb::{Options, Store, SyncPolicy};
+use minicask::{Options, Store, SyncPolicy};
 use std::time::Instant;
 
 const VALUE_SIZE: usize = 100;
 
 fn main() {
-    let dir = std::env::temp_dir().join(format!("caskdb-bench-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("minicask-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
-    println!("caskdb benchmark, {VALUE_SIZE} byte values\n");
+    println!("minicask benchmark, {VALUE_SIZE} byte values\n");
     println!("{:<34} {:>12} {:>14}", "operation", "count", "ops/sec");
     println!("{}", "-".repeat(62));
 

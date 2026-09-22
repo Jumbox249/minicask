@@ -1,5 +1,5 @@
 [package]
-name = "caskdb"
+name = "minicask"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
@@ -10,11 +10,11 @@ keywords = ["database", "key-value", "storage", "bitcask", "embedded"]
 categories = ["database-implementations"]
 
 [[bin]]
-name = "caskdb"
-path = "src/bin/caskdb.rs"
+name = "minicask"
+path = "src/bin/minicask.rs"
 
 [[bin]]
-name = "caskdb-crash-writer"
+name = "minicask-crash-writer"
 path = "src/bin/crash_writer.rs"
 
 [profile.release]

@@ -1,6 +1,6 @@
 mod common;
 
-use caskdb::{Error, Store};
+use minicask::{Error, Store};
 use common::TempDir;
 
 #[test]

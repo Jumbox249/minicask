@@ -1,4 +1,4 @@
-# caskdb
+# minicask
 
 [![CI](https://github.com/Jumbox249/minicask/actions/workflows/ci.yml/badge.svg)](https://github.com/Jumbox249/minicask/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
@@ -9,7 +9,7 @@ An embedded key/value store for Rust, built the way [Bitcask](https://riak.com/a
 No dependencies. Not even for the CRC.
 
 ```rust
-use caskdb::Store;
+use minicask::Store;
 
 let mut store = Store::open("./my-data")?;
 store.put(b"language", b"rust")?;
@@ -98,10 +98,10 @@ Compaction originally ran at 4,087 records/sec because the merge inherited the s
 
 ```console
 $ cargo install --path .
-$ caskdb --dir ./data put greeting "hello world"
-$ caskdb --dir ./data get greeting
+$ minicask --dir ./data put greeting "hello world"
+$ minicask --dir ./data get greeting
 hello world
-$ caskdb --dir ./data stats
+$ minicask --dir ./data stats
 keys         1
 data files   1
 live bytes   40

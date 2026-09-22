@@ -5,7 +5,7 @@
 //! This is what an interrupted append really looks like on disk, and
 //! `tests/recovery.rs` uses it to prove the store survives one.
 
-use caskdb::{Options, Store, SyncPolicy};
+use minicask::{Options, Store, SyncPolicy};
 use std::io::Write;
 
 fn main() {

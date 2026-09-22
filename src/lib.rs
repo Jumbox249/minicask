@@ -1,4 +1,4 @@
-//! `caskdb` is a small embedded key/value store built the way Bitcask is:
+//! `minicask` is a small embedded key/value store built the way Bitcask is:
 //! every write appends to a log file, and an in-memory index remembers where
 //! each key's newest record lives.
 //!
@@ -11,13 +11,13 @@
 //! overwritten or deleted records only comes back when you compact.
 //!
 //! ```no_run
-//! use caskdb::Store;
+//! use minicask::Store;
 //!
 //! let mut store = Store::open("./my-data")?;
 //! store.put(b"language", b"rust")?;
 //! assert_eq!(store.get(b"language")?, Some(b"rust".to_vec()));
 //! store.delete(b"language")?;
-//! # Ok::<(), caskdb::Error>(())
+//! # Ok::<(), minicask::Error>(())
 //! ```
 
 mod crc;

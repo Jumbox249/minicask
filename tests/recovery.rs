@@ -3,7 +3,7 @@
 
 mod common;
 
-use caskdb::{Error, Options, Store};
+use minicask::{Error, Options, Store};
 use common::{corrupt_byte, TempDir};
 use std::io::Write;
 use std::process::Command;
@@ -13,7 +13,7 @@ use std::process::Command;
 #[test]
 fn a_killed_writer_loses_nothing_it_finished() {
     let dir = TempDir::new("kill-9");
-    let status = Command::new(env!("CARGO_BIN_EXE_caskdb-crash-writer"))
+    let status = Command::new(env!("CARGO_BIN_EXE_minicask-crash-writer"))
         .arg(dir.str())
         .arg("500")
         .status()

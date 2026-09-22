@@ -1,14 +1,14 @@
 //! A thin command line wrapper so the store can be poked at without writing
 //! any Rust.
 
-use caskdb::{Options, Store, SyncPolicy};
+use minicask::{Options, Store, SyncPolicy};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-caskdb - an append-only key/value store
+minicask - an append-only key/value store
 
 USAGE:
-    caskdb [--dir PATH] [--no-fsync] <COMMAND> [ARGS]
+    minicask [--dir PATH] [--no-fsync] <COMMAND> [ARGS]
 
 COMMANDS:
     put <key> <value>   Store a value
@@ -19,7 +19,7 @@ COMMANDS:
     compact             Rewrite live records and drop the rest
 
 OPTIONS:
-    --dir PATH          Store directory (default: ./caskdb-data)
+    --dir PATH          Store directory (default: ./minicask-data)
     --no-fsync          Trade power-cut durability for speed
     -h, --help          Print this message
 ";
@@ -28,15 +28,15 @@ fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("caskdb: {err}");
+            eprintln!("minicask: {err}");
             ExitCode::from(2)
         }
     }
 }
 
-fn run() -> caskdb::Result<ExitCode> {
+fn run() -> minicask::Result<ExitCode> {
     let mut args = std::env::args().skip(1).peekable();
-    let mut dir = String::from("./caskdb-data");
+    let mut dir = String::from("./minicask-data");
     let mut opts = Options::default();
 
     while let Some(arg) = args.peek() {
@@ -82,7 +82,7 @@ fn run() -> caskdb::Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
                 None => {
-                    eprintln!("caskdb: no such key: {key}");
+                    eprintln!("minicask: no such key: {key}");
                     Ok(ExitCode::FAILURE)
                 }
             },
@@ -95,7 +95,7 @@ fn run() -> caskdb::Result<ExitCode> {
                 if existed {
                     Ok(ExitCode::SUCCESS)
                 } else {
-                    eprintln!("caskdb: no such key: {key}");
+                    eprintln!("minicask: no such key: {key}");
                     Ok(ExitCode::FAILURE)
                 }
             }
@@ -137,14 +137,14 @@ fn run() -> caskdb::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         other => {
-            eprintln!("caskdb: unknown command: {other}");
+            eprintln!("minicask: unknown command: {other}");
             print!("{USAGE}");
             Ok(ExitCode::from(2))
         }
     }
 }
 
-fn fail(message: &str) -> caskdb::Result<ExitCode> {
-    eprintln!("caskdb: {message}");
+fn fail(message: &str) -> minicask::Result<ExitCode> {
+    eprintln!("minicask: {message}");
     Ok(ExitCode::from(2))
 }
