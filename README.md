@@ -170,24 +170,36 @@ Nineteen cluster scenarios and thirteen protocol tests, including the ones a nai
 - **`commands_survive_relentless_churn`** runs twelve rounds of commit-then-break-something, checking after every round that no two nodes disagree about any index.
 - **`a_stale_append_does_not_shorten_the_log`** delivers a late duplicate that mentions fewer entries than the follower holds, and requires the extra ones to survive. Deleting what a message merely failed to mention is the classic way to lose a committed entry.
 
-A test suite that passes proves nothing on its own, so every safety rule here was checked by breaking it on purpose and confirming the suite noticed. Removing the up-to-date check from voting, truncating the log on every append, trusting the leader's commit index, allowing two votes in one term, an off-by-one in the quorum, committing an earlier term's entry on a replica count, not standing down when cut off, and not recording contact with peers — each one fails at least one test.
+A test suite that passes proves nothing on its own, so every safety rule here was checked by breaking it on purpose and confirming the suite noticed. Thirteen broken variants, each failing at least one test: removing the up-to-date check from voting, truncating the log on every append, trusting the leader's commit index, allowing two votes in one term, an off-by-one in the quorum, committing an earlier term's entry on a replica count, not standing down when cut off, not recording contact with peers, granting a pre-vote to a node that is behind, ignoring the log when answering one, dropping the leader lease, counting pre-vote replies from any round, and not echoing the proposed term on a grant.
 
-The first attempt at this suite caught none of the subtle ones. Every scenario passed against three deliberately broken implementations, because the scenarios never built the interleavings those rules exist for. The rules that cannot be reached through ordinary operation — a leader committing an earlier term's entry is the clearest — are now tested against the state they guard, directly, rather than hoped for through a cluster.
+The first attempt at this suite caught none of the subtle ones. Every scenario passed against three deliberately broken implementations, because the scenarios never built the interleavings those rules exist for. The rules that cannot be reached through ordinary operation â€” a leader committing an earlier term's entry is the clearest â€” are now tested against the state they guard, directly, rather than hoped for through a cluster.
 
 ### Standing down
 
 Plain Raft never tells a leader it has been cut off. It keeps the title until it hears a later term, and it cannot hear one from the wrong side of a partition, so it goes on answering reads from a store the majority has long since moved past. Two rules close that:
 
 - **Check quorum.** A leader that cannot account for a majority within one election timeout stands itself down. It keeps its term, since nothing has been decided; it only stops claiming an office it can no longer do the job of.
-- **A new leader waits before it reads.** Winning an election is not enough. A new leader holds every committed entry, by the rule that decides a vote, but it does not yet know *which* of them are committed — a follower learns that from the leader's next message, and the old leader may have died before sending one. Committing the no-op from its own term settles it, and until then the node will not answer a read.
+- **A new leader waits before it reads.** Winning an election is not enough. A new leader holds every committed entry, by the rule that decides a vote, but it does not yet know *which* of them are committed â€” a follower learns that from the leader's next message, and the old leader may have died before sending one. Committing the no-op from its own term settles it, and until then the node will not answer a read.
 
 The second of those was found by a test that failed only when the suite ran in parallel: a `GET` for a write that had already been acknowledged came back empty, in the window between an election being won and the backlog being applied.
+
+### Asking before standing
+
+A node that has been cut off spends the partition timing out. Raising its term each time it does costs nothing while it is away and a great deal when it returns: its term now leads the cluster's, so a leader that is doing its job perfectly well has to stand down, and an election is held that the returning node was never going to win.
+
+So it asks first. `PreVote` is the hypothetical â€” *if* I stood in the next term, would you have me? â€” and it moves nobody's term, in either direction. Only once a majority has said yes does a node spend a term and stand for real. Two rules make the answer worth having:
+
+- **A node that is hearing from a leader says no**, to canvassers of either kind. It owes the sitting leader the rest of its lease.
+- **The log still decides.** Pre-vote is not a way around the rule that keeps a stale node out. It applies the same test one step earlier and refuses on the same grounds.
+
+A refusal carries the refuser's own term, which is how a node that really has fallen behind finds out. A grant echoes the term that was asked about, so a late yes from an earlier round cannot be counted towards this one.
+
+The effect is that an isolated node's term does not move at all while it is away. One test holds a node out for three hundred ticks, heals the network, and then requires the leader's term to be exactly what it was before.
 
 ### What it does not do yet
 
 - **No snapshots**, so a log grows forever and a node that falls far enough behind is caught up an entry at a time.
 - **Fixed membership.** Adding or removing a node means restarting the cluster.
-- **No pre-vote.** A node returning from a partition has a high term and forces a fresh election, which costs a round trip. It cannot win one — the up-to-date rule sees to that, and there is a test for it — so this is wasted work rather than a safety problem.
 - **Reads go to the leader**, so followers are redundancy and not read capacity.
 
 ## A replicated store
@@ -242,7 +254,7 @@ The log reuses the store's record format, which means its framing, its checksum 
 $ cargo test
 ```
 
-129 tests, including the three that matter:
+144 tests, including the three that matter:
 
 - **`a_killed_writer_loses_nothing_it_finished`** spawns a real child process that writes 500 records, scribbles a header with no body onto the end of the file, then calls `abort()`. No destructor runs, no buffer is flushed, the kernel takes the process out with `SIGABRT`. The test then reopens the store and checks all 500 records, and that it is still writable afterwards.
 - **`corruption_in_a_sealed_file_is_reported`** flips a bit in a file that was already closed and asserts the store refuses to open rather than pretending.

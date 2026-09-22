@@ -15,6 +15,10 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Follower,
+    /// Asking whether an election would be worth holding. A pre-candidate
+    /// has not raised its term and has not voted for itself on disk, so
+    /// this state costs nothing and can be abandoned without trace.
+    PreCandidate,
     Candidate,
     Leader,
 }
@@ -269,33 +273,89 @@ impl<S: Storage> Node<S> {
                     }
                 }
             }
-            Role::Follower | Role::Candidate => {
+            Role::Follower | Role::PreCandidate | Role::Candidate => {
                 self.election_elapsed += 1;
                 if self.election_elapsed >= self.election_timeout {
-                    // Either nobody is leading, or the last election was
-                    // split. Both are answered the same way.
-                    self.become_candidate(&mut actions)?;
+                    // Nobody is leading, or the last attempt was split, or
+                    // the question went unanswered. All three are answered
+                    // by asking again before running.
+                    self.become_pre_candidate(&mut actions)?;
                 }
             }
         }
         Ok(actions)
     }
 
-    /// Stand for election now instead of waiting for the timeout.
+    /// Stand for election now, skipping the pre-vote.
     ///
-    /// Useful for bringing a fresh cluster up without waiting one out, and
-    /// for handing leadership somewhere deliberately. It is always safe: a
+    /// This raises the term whether or not anyone would have voted for it,
+    /// so it is for handing leadership over deliberately and for bringing
+    /// a fresh cluster up without waiting one out. It is always safe: a
     /// node that should not win still will not, because the voters decide.
+    /// An ordinary timeout asks first, via [`Role::PreCandidate`].
     pub fn campaign(&mut self) -> Result<Vec<Action>> {
         let mut actions = Vec::new();
         self.become_candidate(&mut actions)?;
         Ok(actions)
     }
 
+    /// Ask the cluster whether an election would be worth holding, the way
+    /// an ordinary timeout does.
+    ///
+    /// Unlike [`campaign`](Node::campaign) this raises no term and writes
+    /// nothing, so a node that would not win leaves no trace of having
+    /// asked.
+    pub fn pre_vote(&mut self) -> Result<Vec<Action>> {
+        let mut actions = Vec::new();
+        self.become_pre_candidate(&mut actions)?;
+        Ok(actions)
+    }
+
+    /// Run the election timer out without acting on it, so that this node
+    /// no longer counts a sitting leader as recently heard from.
+    ///
+    /// Only the tests need this, to put a node in the state a real one
+    /// reaches by waiting.
+    #[doc(hidden)]
+    pub fn expire_election_timer(&mut self) {
+        self.election_elapsed = self.election_timeout;
+    }
+
     /// A message arrived from `from`.
     pub fn step(&mut self, from: NodeId, message: Message) -> Result<Vec<Action>> {
         let mut actions = Vec::new();
         let term = message.term();
+
+        // A node that is still hearing from a leader owes it the rest of
+        // its lease, and says no to anyone canvassing. Without this a node
+        // returning from a partition unseats a leader that is doing its
+        // job perfectly well, purely by asking.
+        if message.is_vote_request()
+            && self.leader_id.is_some()
+            && self.election_elapsed < self.election_timeout
+        {
+            actions.push(self.refuse_vote(from, &message));
+            return Ok(actions);
+        }
+
+        // Pre-vote traffic never moves anyone's term, in either direction.
+        // That is the point of asking first, so it is handled ahead of the
+        // rule that would.
+        match message {
+            Message::PreVote {
+                term,
+                last_log_index,
+                last_log_term,
+            } => {
+                self.handle_pre_vote(from, term, last_log_index, last_log_term, &mut actions);
+                return Ok(actions);
+            }
+            Message::PreVoteReply { term, granted } => {
+                self.handle_pre_vote_reply(from, term, granted, &mut actions)?;
+                return Ok(actions);
+            }
+            _ => {}
+        }
 
         if term > self.term() {
             // Someone is in a later term, so whatever this node thought it
@@ -310,6 +370,10 @@ impl<S: Storage> Node<S> {
         }
 
         match message {
+            // Both were answered above, before anything could touch a term.
+            Message::PreVote { .. } | Message::PreVoteReply { .. } => {
+                unreachable!("pre-vote traffic returns before reaching here")
+            }
             Message::RequestVote {
                 last_log_index,
                 last_log_term,
@@ -395,6 +459,87 @@ impl<S: Storage> Node<S> {
             })?;
         }
         self.reset_election_timer();
+        Ok(())
+    }
+
+    /// Ask the cluster whether an election would be worth holding.
+    ///
+    /// Nothing is written to disk and the term does not move, so a
+    /// pre-candidate that hears nothing back has cost the cluster nothing
+    /// and is free to ask again later.
+    fn become_pre_candidate(&mut self, actions: &mut Vec<Action>) -> Result<()> {
+        self.role = Role::PreCandidate;
+        self.leader_id = None;
+        self.votes.clear();
+        self.votes.insert(self.id);
+        self.reset_election_timer();
+
+        if self.has_majority(self.votes.len()) {
+            // A single-node cluster needs nobody's permission.
+            return self.become_candidate(actions);
+        }
+
+        let message = Message::PreVote {
+            term: self.term() + 1,
+            last_log_index: self.storage.last_index(),
+            last_log_term: self.storage.last_term(),
+        };
+        for &peer in &self.peers {
+            actions.push(Action::Send {
+                to: peer,
+                message: message.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Answer the hypothetical. No vote is recorded, because none was
+    /// cast: this node stays free to vote for whoever actually stands.
+    fn handle_pre_vote(
+        &mut self,
+        from: NodeId,
+        proposed_term: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+        actions: &mut Vec<Action>,
+    ) {
+        let worth_running = proposed_term > self.term();
+        let granted = worth_running && self.storage.is_up_to_date(last_log_index, last_log_term);
+
+        actions.push(Action::Send {
+            to: from,
+            message: Message::PreVoteReply {
+                // Echoing the term that was asked about, on a yes, lets the
+                // asker tell this round's replies from the last one's. A no
+                // carries our own term instead, which is how a node that
+                // has fallen behind finds out.
+                term: if granted { proposed_term } else { self.term() },
+                granted,
+            },
+        });
+    }
+
+    fn handle_pre_vote_reply(
+        &mut self,
+        from: NodeId,
+        term: u64,
+        granted: bool,
+        actions: &mut Vec<Action>,
+    ) -> Result<()> {
+        if granted {
+            // Only this round's answers count, and only while still asking.
+            if self.role == Role::PreCandidate && term == self.term() + 1 {
+                self.votes.insert(from);
+                if self.has_majority(self.votes.len()) {
+                    // The cluster would have us. Now the term is worth it.
+                    self.become_candidate(actions)?;
+                }
+            }
+        } else if term > self.term() {
+            // Refused by someone further ahead, which answers a different
+            // question: we are the ones who are behind.
+            self.become_follower(term, None)?;
+        }
         Ok(())
     }
 
@@ -707,11 +852,32 @@ impl<S: Storage> Node<S> {
 
     // -- odds and ends --------------------------------------------------
 
+    /// Say no to a canvasser without adopting its term or its premise.
+    fn refuse_vote(&self, from: NodeId, message: &Message) -> Action {
+        Action::Send {
+            to: from,
+            message: match message {
+                Message::PreVote { .. } => Message::PreVoteReply {
+                    term: self.term(),
+                    granted: false,
+                },
+                _ => Message::RequestVoteReply {
+                    term: self.term(),
+                    granted: false,
+                },
+            },
+        }
+    }
+
     fn reply_stale(&self, from: NodeId, message: &Message) -> Action {
         let term = self.term();
         Action::Send {
             to: from,
             message: match message {
+                Message::PreVote { .. } => Message::PreVoteReply {
+                    term,
+                    granted: false,
+                },
                 Message::RequestVote { .. } => Message::RequestVoteReply {
                     term,
                     granted: false,
@@ -1089,5 +1255,233 @@ mod tests {
         assert_eq!(node.role(), Role::Follower);
         assert_eq!(node.term(), 9);
         assert_eq!(node.leader(), Some(3));
+    }
+
+    // -- pre-vote -------------------------------------------------------
+
+    fn pre_vote_request(term: u64, last_log_index: u64, last_log_term: u64) -> Message {
+        Message::PreVote {
+            term,
+            last_log_index,
+            last_log_term,
+        }
+    }
+
+    fn pre_granted(actions: &[Action]) -> bool {
+        match actions {
+            [Action::Send {
+                message: Message::PreVoteReply { granted, .. },
+                ..
+            }] => *granted,
+            other => panic!("expected one pre-vote reply, got {other:?}"),
+        }
+    }
+
+    fn pre_reply_term(actions: &[Action]) -> u64 {
+        match actions {
+            [Action::Send {
+                message: Message::PreVoteReply { term, .. },
+                ..
+            }] => *term,
+            other => panic!("expected one pre-vote reply, got {other:?}"),
+        }
+    }
+
+    /// The property the whole mechanism rests on: answering the question
+    /// costs the answerer nothing.
+    #[test]
+    fn answering_a_pre_vote_changes_nothing() {
+        let mut node = follower(5, &[(1, 5)]);
+        let before = node.storage().hard_state();
+
+        // A proposed term far beyond ours, which a real RequestVote would
+        // force us to adopt.
+        let actions = node.step(2, pre_vote_request(99, 1, 5)).unwrap();
+        assert!(pre_granted(&actions));
+
+        assert_eq!(
+            node.storage().hard_state(),
+            before,
+            "answering a hypothetical must not move the term or spend the vote"
+        );
+        assert_eq!(node.role(), Role::Follower);
+    }
+
+    /// And asking costs the asker nothing either, until the answer is yes.
+    #[test]
+    fn asking_does_not_raise_the_term() {
+        let mut node = follower(5, &[(1, 5)]);
+        node.pre_vote().unwrap();
+
+        assert_eq!(node.role(), Role::PreCandidate);
+        assert_eq!(node.term(), 5, "asking is not standing");
+        assert_eq!(
+            node.storage().hard_state().voted_for,
+            None,
+            "a pre-candidate has not voted for itself"
+        );
+    }
+
+    #[test]
+    fn a_pre_candidate_with_a_stale_log_is_refused() {
+        let mut node = follower(5, &[(1, 3), (2, 5)]);
+        assert!(
+            !pre_granted(&node.step(2, pre_vote_request(6, 2, 3)).unwrap()),
+            "a stale log must not be told an election is worth holding"
+        );
+        assert!(
+            !pre_granted(&node.step(2, pre_vote_request(6, 1, 5)).unwrap()),
+            "a shorter log at the same term must not either"
+        );
+        assert!(pre_granted(
+            &node.step(2, pre_vote_request(6, 2, 5)).unwrap()
+        ));
+    }
+
+    #[test]
+    fn a_node_that_is_behind_is_refused_and_told_so() {
+        let mut node = follower(9, &[(1, 9)]);
+        // Its term is 5, so it proposes 6, which is still behind ours.
+        let actions = node.step(2, pre_vote_request(6, 1, 9)).unwrap();
+        assert!(!pre_granted(&actions));
+        assert_eq!(
+            pre_reply_term(&actions),
+            9,
+            "a refusal carries our term, which is how the asker learns"
+        );
+    }
+
+    #[test]
+    fn a_granted_reply_echoes_the_term_that_was_asked_about() {
+        let mut node = follower(5, &[(1, 5)]);
+        let actions = node.step(2, pre_vote_request(6, 1, 5)).unwrap();
+        assert!(pre_granted(&actions));
+        assert_eq!(
+            pre_reply_term(&actions),
+            6,
+            "a yes echoes the proposed term so rounds can be told apart"
+        );
+    }
+
+    /// A late yes from a previous round must not help win this one.
+    #[test]
+    fn a_reply_from_an_earlier_round_does_not_count() {
+        let mut node = follower(5, &[(1, 5)]);
+        node.pre_vote().unwrap();
+
+        // Answers to a question this node is no longer asking.
+        node.step(
+            2,
+            Message::PreVoteReply {
+                term: 5,
+                granted: true,
+            },
+        )
+        .unwrap();
+        node.step(
+            3,
+            Message::PreVoteReply {
+                term: 5,
+                granted: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            node.role(),
+            Role::PreCandidate,
+            "stale answers carried a node into an election"
+        );
+        assert_eq!(node.term(), 5);
+    }
+
+    /// Enough answers to this round, and only then is the term worth
+    /// spending.
+    #[test]
+    fn a_majority_of_yeses_starts_a_real_election() {
+        let mut node = follower(5, &[(1, 5)]);
+        node.pre_vote().unwrap();
+        let actions = node
+            .step(
+                2,
+                Message::PreVoteReply {
+                    term: 6,
+                    granted: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(node.role(), Role::Candidate);
+        assert_eq!(node.term(), 6, "now the term moves");
+        assert_eq!(
+            node.storage().hard_state().voted_for,
+            Some(1),
+            "and now it votes for itself, durably"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|Action::Send { message, .. }| matches!(message, Message::RequestVote { .. })),
+            "it should be canvassing for real now"
+        );
+    }
+
+    /// A no from someone further ahead is how a node that has been away
+    /// discovers it is the one that is behind.
+    #[test]
+    fn a_refusal_from_a_later_term_makes_a_pre_candidate_stand_down() {
+        let mut node = follower(5, &[(1, 5)]);
+        node.pre_vote().unwrap();
+        node.step(
+            2,
+            Message::PreVoteReply {
+                term: 20,
+                granted: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.term(), 20, "it caught up to the term it was told");
+    }
+
+    /// While a leader is being heard from, nobody canvassing gets a
+    /// hearing, whether the question is hypothetical or not.
+    #[test]
+    fn a_node_hearing_from_a_leader_refuses_everyone() {
+        let mut node = follower(5, &[(1, 5)]);
+        // A heartbeat, which makes node 2 the leader and starts the lease.
+        node.step(2, append(5, (1, 5), &[], 0)).unwrap();
+        assert_eq!(node.leader(), Some(2));
+
+        assert!(
+            !pre_granted(&node.step(3, pre_vote_request(6, 1, 5)).unwrap()),
+            "a pre-vote was granted while a leader was live"
+        );
+        assert!(
+            !granted(&node.step(3, vote_request(6, 1, 5)).unwrap()),
+            "a vote was granted while a leader was live"
+        );
+        assert_eq!(
+            node.term(),
+            5,
+            "and neither request was allowed to move the term"
+        );
+    }
+
+    /// The lease has to run out, or a cluster whose leader has died would
+    /// never replace it.
+    #[test]
+    fn loyalty_ends_once_the_leader_goes_quiet() {
+        let mut node = follower(5, &[(1, 5)]);
+        node.step(2, append(5, (1, 5), &[], 0)).unwrap();
+        assert!(!pre_granted(
+            &node.step(3, pre_vote_request(6, 1, 5)).unwrap()
+        ));
+
+        node.expire_election_timer();
+        assert!(
+            pre_granted(&node.step(3, pre_vote_request(6, 1, 5)).unwrap()),
+            "a node held its loyalty past any evidence the leader was alive"
+        );
     }
 }

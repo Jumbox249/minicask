@@ -9,6 +9,30 @@ use super::log::{Entry, NodeId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
+    /// A hypothetical question: *if* I stood in `term`, would you vote for
+    /// me? Asking costs the asker nothing and changes nobody's term, which
+    /// is the entire point.
+    ///
+    /// A node that has been cut off spends the partition timing out and
+    /// standing for election. Without this it raises its term each time,
+    /// and on returning it forces a healthy leader to stand down and the
+    /// cluster to hold an election it cannot win. Asking first means its
+    /// term never moves while it is away.
+    PreVote {
+        /// The term it *would* run in, which is one past its own. Nobody
+        /// adopts this term; it is a question, not a claim.
+        term: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
+    /// A granted reply echoes the term that was asked about, so a late
+    /// reply from an earlier round is not counted twice. A refusal instead
+    /// carries the responder's own term, which is how a node that has
+    /// fallen behind finds out.
+    PreVoteReply {
+        term: u64,
+        granted: bool,
+    },
     /// A candidate asking for a vote in `term`. The log position lets the
     /// receiver refuse a candidate whose log is behind its own, which is
     /// what stops a stale node from being elected and erasing entries.
@@ -56,19 +80,27 @@ impl Message {
     /// about comparing it to your own.
     pub fn term(&self) -> u64 {
         match self {
-            Message::RequestVote { term, .. }
+            Message::PreVote { term, .. }
+            | Message::PreVoteReply { term, .. }
+            | Message::RequestVote { term, .. }
             | Message::RequestVoteReply { term, .. }
             | Message::AppendEntries { term, .. }
             | Message::AppendEntriesReply { term, .. } => *term,
         }
     }
 
-    /// True for the two messages a peer sends unprompted. Replies to a
+    /// Whether this asks for a vote, real or hypothetical. Both are
+    /// refused by a node that is still hearing from a leader.
+    pub fn is_vote_request(&self) -> bool {
+        matches!(self, Message::PreVote { .. } | Message::RequestVote { .. })
+    }
+
+    /// True for the messages a peer sends unprompted. Replies to a
     /// stale request are not evidence that anyone is alive and leading.
     pub fn is_request(&self) -> bool {
         matches!(
             self,
-            Message::RequestVote { .. } | Message::AppendEntries { .. }
+            Message::PreVote { .. } | Message::RequestVote { .. } | Message::AppendEntries { .. }
         )
     }
 }

@@ -409,6 +409,7 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
                     match node.role() {
                         Role::Leader => "leader",
                         Role::Candidate => "candidate",
+                        Role::PreCandidate => "pre-candidate",
                         Role::Follower => "follower",
                     },
                     node.term(),

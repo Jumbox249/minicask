@@ -250,6 +250,27 @@ impl Cluster {
         self.inflight.clear();
     }
 
+    /// Make a node ask whether an election would be worth holding, the way
+    /// an ordinary timeout would.
+    fn pre_vote(&mut self, id: NodeId) {
+        match self.slots.get_mut(&id) {
+            Some(Slot::Running(node)) => {
+                let actions = node.pre_vote().expect("pre-vote");
+                queue(&mut self.inflight, id, actions);
+            }
+            _ => panic!("node {id} is not running"),
+        }
+    }
+
+    /// Run a node's election timer down without letting it act, so that it
+    /// no longer owes a sitting leader its loyalty.
+    fn expire_lease(&mut self, id: NodeId) {
+        match self.slots.get_mut(&id) {
+            Some(Slot::Running(node)) => node.expire_election_timer(),
+            _ => panic!("node {id} is not running"),
+        }
+    }
+
     fn propose(&mut self, id: NodeId, command: &[u8]) -> u64 {
         let index = match self.slots.get_mut(&id) {
             Some(Slot::Running(node)) => {
@@ -824,8 +845,7 @@ fn a_stale_candidate_cannot_win_even_with_the_highest_term() {
     let stale = (1..=5).find(|&id| id != leader).unwrap();
     let rest: Vec<NodeId> = (1..=5).filter(|&id| id != stale).collect();
 
-    // Cut it off and commit without it. It spends the time campaigning,
-    // which is what drives its term up.
+    // Cut it off and commit without it.
     c.partition(&[&rest, &[stale]]);
     let mut expected = Vec::new();
     for i in 0..6u8 {
@@ -839,6 +859,15 @@ fn a_stale_candidate_cannot_win_even_with_the_highest_term() {
     });
     c.tick_n(120);
 
+    // Drive its term above the cluster's on purpose. Left alone it would
+    // not get there, because the pre-vote keeps a node that cannot win
+    // from raising its term at all; `campaign` is the way past that, and
+    // the point here is what happens to a stale node that *has* somehow
+    // ended up in front.
+    for _ in 0..12 {
+        c.campaign(stale);
+        c.tick_n(2);
+    }
     let stale_term = c.node(stale).term();
     assert!(
         stale_term > c.node(leader).term(),
@@ -1010,4 +1039,151 @@ fn a_leader_that_stands_down_can_be_re_elected() {
         );
     }
     c.assert_logs_agree();
+}
+
+// -- pre-vote -----------------------------------------------------------
+
+/// The reason pre-vote exists. A node that has been cut off spends the
+/// partition timing out, and on returning it must not cost the cluster an
+/// election it was never going to win.
+#[test]
+fn a_node_returning_from_a_partition_does_not_disturb_the_leader() {
+    let mut c = Cluster::new(5);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    let away = (1..=5).find(|&id| id != leader).unwrap();
+    let rest: Vec<NodeId> = (1..=5).filter(|&id| id != away).collect();
+
+    let term = c.node(leader).term();
+    c.partition(&[&rest, &[away]]);
+    c.propose(leader, b"while you were out");
+    let last = c.node(leader).last_index();
+    c.run_until("the majority to commit", |c| {
+        rest.iter().all(|&id| c.committed_on(id) >= last)
+    });
+    // Long enough for many election timeouts to come and go.
+    c.tick_n(300);
+
+    c.heal();
+    c.run_until("the returning node to catch up", |c| {
+        c.committed_on(away) >= last
+    });
+
+    assert_eq!(
+        c.node(leader).term(),
+        term,
+        "the returning node forced an election"
+    );
+    assert_eq!(c.leader(), Some(leader), "the leader was unseated");
+    assert_eq!(c.node(away).role(), Role::Follower);
+    c.assert_logs_agree();
+}
+
+/// The mechanism behind that: a node with nobody to ask never raises its
+/// term, so it has nothing to disturb anyone with when it gets back.
+#[test]
+fn a_node_with_nobody_to_ask_does_not_raise_its_term() {
+    let mut c = Cluster::new(5);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    let away = (1..=5).find(|&id| id != leader).unwrap();
+    let rest: Vec<NodeId> = (1..=5).filter(|&id| id != away).collect();
+
+    c.partition(&[&rest, &[away]]);
+    let term = c.node(away).term();
+    c.tick_n(300);
+
+    assert_eq!(
+        c.node(away).term(),
+        term,
+        "an isolated node raised its term with nobody to elect it"
+    );
+    assert_eq!(
+        c.node(away).role(),
+        Role::PreCandidate,
+        "it should be stuck asking, not standing"
+    );
+}
+
+/// A node that is hearing from a healthy leader refuses to canvass for
+/// anyone else, which is what keeps a sitting leader in place.
+#[test]
+fn a_followers_loyalty_lasts_as_long_as_the_leader_is_heard_from() {
+    let mut c = Cluster::new(3);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    let follower = (1..=3).find(|&id| id != leader).unwrap();
+    c.run_until("the follower to settle", |c| {
+        c.node(follower).leader() == Some(leader)
+    });
+
+    // The third node asks, repeatedly, while the leader is perfectly fine.
+    let other = (1..=3).find(|&id| id != leader && id != follower).unwrap();
+    let term = c.node(leader).term();
+    for _ in 0..20 {
+        c.pre_vote(other);
+        c.tick_n(3);
+    }
+
+    assert_eq!(c.leader(), Some(leader), "a healthy leader was unseated");
+    assert_eq!(c.node(leader).term(), term, "an election was forced");
+}
+
+/// But loyalty is not blind. Once the leader really has gone, the same
+/// question has to be answered differently or nothing would ever recover.
+#[test]
+fn loyalty_expires_when_the_leader_does() {
+    let mut c = Cluster::new(3);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+
+    c.kill(leader);
+    c.run_until("a replacement", |c| c.leader().is_some());
+    assert_ne!(c.leader(), Some(leader));
+}
+
+/// Pre-vote must not become a way round the up-to-date rule.
+#[test]
+fn a_stale_node_is_refused_at_the_pre_vote() {
+    let mut c = Cluster::new(5);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    let stale = (1..=5).find(|&id| id != leader).unwrap();
+    let rest: Vec<NodeId> = (1..=5).filter(|&id| id != stale).collect();
+
+    c.partition(&[&rest, &[stale]]);
+    for i in 0..6u8 {
+        c.propose(leader, &[b'a' + i]);
+    }
+    let last = c.node(leader).last_index();
+    c.run_until("the majority to commit", |c| {
+        rest.iter().all(|&id| c.committed_on(id) >= last)
+    });
+
+    // Heal with nothing in flight and let the stale node ask first, before
+    // any heartbeat can reach it. Even with every lease expired, its log
+    // is not good enough and the answer has to be no.
+    c.heal();
+    c.drop_inflight();
+    for id in &rest {
+        c.expire_lease(*id);
+    }
+    let before = c.node(stale).term();
+    c.pre_vote(stale);
+    c.tick_n(6);
+
+    // It may well be a follower by now, because the leader's next
+    // heartbeat reaches it and it accepts. What it must never have been is
+    // a candidate: nobody told it an election was worth holding, so its
+    // term never moved and it never stood.
+    assert!(
+        matches!(c.node(stale).role(), Role::PreCandidate | Role::Follower),
+        "a stale node was told an election would be worth holding, and stood: {:?}",
+        c.node(stale).role()
+    );
+    assert_eq!(
+        c.node(stale).term(),
+        before,
+        "a refused pre-vote must leave the term where it was"
+    );
 }

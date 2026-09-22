@@ -27,6 +27,8 @@ const REQUEST_VOTE: u8 = 1;
 const REQUEST_VOTE_REPLY: u8 = 2;
 const APPEND_ENTRIES: u8 = 3;
 const APPEND_ENTRIES_REPLY: u8 = 4;
+const PRE_VOTE: u8 = 5;
+const PRE_VOTE_REPLY: u8 = 6;
 
 /// Tags for a log entry's payload.
 const ENTRY_NOOP: u8 = 0;
@@ -76,6 +78,19 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<Option<(NodeId, Message)>>
 fn encode(message: &Message) -> Vec<u8> {
     let mut out = Vec::new();
     match message {
+        Message::PreVote {
+            term,
+            last_log_index,
+            last_log_term,
+        } => {
+            out.push(PRE_VOTE);
+            put_u64(&mut out, &[*term, *last_log_index, *last_log_term]);
+        }
+        Message::PreVoteReply { term, granted } => {
+            out.push(PRE_VOTE_REPLY);
+            put_u64(&mut out, &[*term]);
+            out.push(u8::from(*granted));
+        }
         Message::RequestVote {
             term,
             last_log_index,
@@ -151,6 +166,15 @@ fn decode(body: &[u8]) -> Option<Message> {
     let mut r = Reader { body, at: 0 };
     let tag = r.u8()?;
     let message = match tag {
+        PRE_VOTE => Message::PreVote {
+            term: r.u64()?,
+            last_log_index: r.u64()?,
+            last_log_term: r.u64()?,
+        },
+        PRE_VOTE_REPLY => Message::PreVoteReply {
+            term: r.u64()?,
+            granted: r.bool()?,
+        },
         REQUEST_VOTE => Message::RequestVote {
             term: r.u64()?,
             last_log_index: r.u64()?,
@@ -272,6 +296,19 @@ mod tests {
 
     #[test]
     fn every_message_round_trips() {
+        round_trip(Message::PreVote {
+            term: 9,
+            last_log_index: 4,
+            last_log_term: 3,
+        });
+        round_trip(Message::PreVoteReply {
+            term: 9,
+            granted: true,
+        });
+        round_trip(Message::PreVoteReply {
+            term: 9,
+            granted: false,
+        });
         round_trip(Message::RequestVote {
             term: 9,
             last_log_index: 4,
