@@ -29,6 +29,8 @@ const APPEND_ENTRIES: u8 = 3;
 const APPEND_ENTRIES_REPLY: u8 = 4;
 const PRE_VOTE: u8 = 5;
 const PRE_VOTE_REPLY: u8 = 6;
+const INSTALL_SNAPSHOT: u8 = 7;
+const INSTALL_SNAPSHOT_REPLY: u8 = 8;
 
 /// Tags for a log entry's payload.
 const ENTRY_NOOP: u8 = 0;
@@ -137,6 +139,32 @@ fn encode(message: &Message) -> Vec<u8> {
                 }
             }
         }
+        Message::InstallSnapshot {
+            term,
+            last_index,
+            last_term,
+            offset,
+            data,
+            done,
+        } => {
+            out.push(INSTALL_SNAPSHOT);
+            put_u64(
+                &mut out,
+                &[*term, *last_index, *last_term, *offset, data.len() as u64],
+            );
+            out.extend_from_slice(data);
+            out.push(u8::from(*done));
+        }
+        Message::InstallSnapshotReply {
+            term,
+            last_index,
+            next_offset,
+            done,
+        } => {
+            out.push(INSTALL_SNAPSHOT_REPLY);
+            put_u64(&mut out, &[*term, *last_index, *next_offset]);
+            out.push(u8::from(*done));
+        }
         Message::AppendEntriesReply {
             term,
             success,
@@ -220,6 +248,28 @@ fn decode(body: &[u8]) -> Option<Message> {
                 leader_commit,
             }
         }
+        INSTALL_SNAPSHOT => {
+            let term = r.u64()?;
+            let last_index = r.u64()?;
+            let last_term = r.u64()?;
+            let offset = r.u64()?;
+            let len = r.u64()?;
+            let data = r.bytes(len)?.to_vec();
+            Message::InstallSnapshot {
+                term,
+                last_index,
+                last_term,
+                offset,
+                data,
+                done: r.bool()?,
+            }
+        }
+        INSTALL_SNAPSHOT_REPLY => Message::InstallSnapshotReply {
+            term: r.u64()?,
+            last_index: r.u64()?,
+            next_offset: r.u64()?,
+            done: r.bool()?,
+        },
         APPEND_ENTRIES_REPLY => {
             let term = r.u64()?;
             let match_index = r.u64()?;
@@ -292,6 +342,38 @@ mod tests {
         let (from, decoded) = read_message(&mut &wire[..]).unwrap().unwrap();
         assert_eq!(from, 7);
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn snapshot_messages_round_trip() {
+        round_trip(Message::InstallSnapshot {
+            term: 4,
+            last_index: 900,
+            last_term: 3,
+            offset: 1 << 20,
+            data: b"\r\n\0binary snapshot bytes\xff".to_vec(),
+            done: false,
+        });
+        round_trip(Message::InstallSnapshot {
+            term: 4,
+            last_index: 900,
+            last_term: 3,
+            offset: 0,
+            data: Vec::new(),
+            done: true,
+        });
+        round_trip(Message::InstallSnapshotReply {
+            term: 4,
+            last_index: 900,
+            next_offset: 12345,
+            done: false,
+        });
+        round_trip(Message::InstallSnapshotReply {
+            term: 4,
+            last_index: 900,
+            next_offset: 0,
+            done: true,
+        });
     }
 
     #[test]

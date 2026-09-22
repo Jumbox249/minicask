@@ -58,6 +58,32 @@ pub enum Message {
         entries: Vec<Entry>,
         leader_commit: u64,
     },
+    /// The state a follower needs but the leader can no longer send as
+    /// entries, because it has folded them into a snapshot. Sent in pieces
+    /// of about `max_append_bytes`, each acknowledged before the next.
+    InstallSnapshot {
+        term: u64,
+        /// The index and term of the last entry the snapshot covers.
+        last_index: u64,
+        last_term: u64,
+        /// Where in the snapshot's data this piece begins.
+        offset: u64,
+        data: Vec<u8>,
+        /// Whether this is the final piece.
+        done: bool,
+    },
+    InstallSnapshotReply {
+        term: u64,
+        /// Echoed, so the leader can tell a reply about the snapshot it is
+        /// sending from one about a snapshot it has since replaced.
+        last_index: u64,
+        /// How much of the snapshot the follower now holds, which is where
+        /// the leader carries on from. A follower that missed a piece, or
+        /// saw one twice, says so here rather than failing.
+        next_offset: u64,
+        /// The snapshot is installed.
+        done: bool,
+    },
     AppendEntriesReply {
         term: u64,
         success: bool,
@@ -85,7 +111,9 @@ impl Message {
             | Message::RequestVote { term, .. }
             | Message::RequestVoteReply { term, .. }
             | Message::AppendEntries { term, .. }
-            | Message::AppendEntriesReply { term, .. } => *term,
+            | Message::AppendEntriesReply { term, .. }
+            | Message::InstallSnapshot { term, .. }
+            | Message::InstallSnapshotReply { term, .. } => *term,
         }
     }
 
@@ -100,7 +128,10 @@ impl Message {
     pub fn is_request(&self) -> bool {
         matches!(
             self,
-            Message::PreVote { .. } | Message::RequestVote { .. } | Message::AppendEntries { .. }
+            Message::PreVote { .. }
+                | Message::RequestVote { .. }
+                | Message::AppendEntries { .. }
+                | Message::InstallSnapshot { .. }
         )
     }
 }

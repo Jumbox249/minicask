@@ -4,12 +4,13 @@
 //! acknowledged are on the platter before it replies. [`MemStorage`] is
 //! enough to run the deterministic tests; this is what a real node uses.
 //!
-//! Two files per node:
+//! Three files per node:
 //!
 //! ```text
 //! raft/
-//!   hard-state   term and vote, rewritten in place, 20 bytes
-//!   entries      the log, append-only, one record per entry
+//!   hard-state   term and vote, replaced whole, 20 bytes
+//!   entries      the log after the snapshot, append-only, one record per entry
+//!   snapshot     the state machine as of some index, replaced whole
 //! ```
 //!
 //! The entries file reuses the store's own record format, so the framing,
@@ -18,9 +19,16 @@
 //! index and term; its value is the command, with a tombstone flag
 //! standing in for the no-op that carries none.
 //!
+//! Taking a snapshot touches two files, and no filesystem changes two
+//! files at once. The snapshot is written first and the entries file
+//! rewritten second, so a crash in between leaves a snapshot beside a log
+//! that still holds the entries it covers. Opening a directory reconciles
+//! the two by the same rule taking the snapshot applies, which makes
+//! finishing the job on the next start the same as having finished it.
+//!
 //! [`MemStorage`]: super::MemStorage
 
-use super::log::{Command, Entry, HardState, Storage};
+use super::log::{Command, Entry, EntryLog, HardState, SnapshotMeta, Storage};
 use crate::crc::crc32_parts;
 use crate::error::{Error, Result};
 use crate::record::{self, Header, HEADER_LEN};
@@ -33,6 +41,10 @@ const HARD_STATE_LEN: usize = 20;
 /// real node id of `u64::MAX` is not a thing anyone should configure.
 const NO_VOTE: u64 = u64::MAX;
 
+/// The snapshot file: a checksum over everything after it, the index and
+/// term it covers, then the data.
+const SNAPSHOT_HEADER_LEN: u64 = 4 + 8 + 8;
+
 /// A node's consensus state, held on disk and cached in memory.
 ///
 /// Every write is fsynced before it returns. That is not a tunable: a node
@@ -42,48 +54,117 @@ pub struct DiskStorage {
     dir: PathBuf,
     entries_file: File,
     hard_state: HardState,
-    entries: Vec<Entry>,
-    /// Where each entry starts in the file, so that a truncation is a
-    /// `set_len` rather than a rewrite.
+    log: EntryLog,
+    /// Where each held entry starts in the entries file, so that a
+    /// truncation is a `set_len` rather than a rewrite.
     offsets: Vec<u64>,
     end: u64,
+    snapshot_len: u64,
 }
 
 impl DiskStorage {
-    /// Open, creating the directory and both files if they are not there,
-    /// and recovering whatever a previous run left behind.
+    /// Open, creating the directory and files if they are not there, and
+    /// recovering whatever a previous run left behind.
     pub fn open<P: AsRef<Path>>(dir: P) -> Result<DiskStorage> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
         let hard_state = read_hard_state(&dir.join("hard-state"))?;
-        let path = dir.join("entries");
+        let (base, snapshot_len) = read_snapshot_header(&dir)?;
+
         let mut entries_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)?;
-
+            .open(dir.join("entries"))?;
         let (entries, offsets, end) = recover(&mut entries_file)?;
 
-        Ok(DiskStorage {
+        let mut storage = DiskStorage {
             dir,
             entries_file,
             hard_state,
-            entries,
+            log: EntryLog::default(),
             offsets,
             end,
-        })
+            snapshot_len,
+        };
+
+        match entries.first().map(|e| e.index) {
+            // The log starts exactly where the snapshot ends: the usual case.
+            None => storage.log = EntryLog::new(base, entries),
+            Some(first) if first == base.index + 1 => storage.log = EntryLog::new(base, entries),
+            // Entries the snapshot already covers. Either a crash came
+            // between writing the snapshot and rewriting the log, or the
+            // snapshot was installed from a leader over a log that had
+            // diverged from it. Apply the rule that taking the snapshot
+            // would have, then finish the rewrite it was cut short of.
+            Some(first) if first <= base.index => {
+                let mut log = EntryLog::new(
+                    SnapshotMeta {
+                        index: first - 1,
+                        term: 0,
+                    },
+                    entries,
+                );
+                // The stand-in base above is never consulted: compacting
+                // to a real snapshot replaces it.
+                log.compact(base);
+                storage.log = log;
+                storage.rewrite_entries()?;
+            }
+            // A hole between the snapshot and the first entry after it.
+            // Neither order of writes can produce that, so it is damage.
+            Some(_) => {
+                return Err(Error::Corrupt {
+                    file_id: 0,
+                    offset: 0,
+                    detail: "the raft log does not begin where the snapshot ends",
+                })
+            }
+        }
+        Ok(storage)
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// Bytes the log occupies on disk.
+    /// Bytes the log occupies on disk, not counting the snapshot.
     pub fn disk_bytes(&self) -> u64 {
         self.end
+    }
+
+    /// Replace the entries file with just the entries the log still holds.
+    ///
+    /// Built beside the old file and renamed over it, so a crash leaves one
+    /// or the other. The new file's handle takes over before the rename:
+    /// Windows will not replace a file that is still open.
+    fn rewrite_entries(&mut self) -> Result<()> {
+        let mut buf = Vec::new();
+        let mut offsets = Vec::with_capacity(self.log.entries().len());
+        for entry in self.log.entries() {
+            offsets.push(buf.len() as u64);
+            buf.extend_from_slice(&encode_entry(entry)?);
+        }
+
+        let tmp = self.dir.join("entries.tmp");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+
+        self.entries_file = file;
+        std::fs::rename(&tmp, self.dir.join("entries"))?;
+        crate::log::sync_dir(&self.dir)?;
+
+        self.offsets = offsets;
+        self.end = buf.len() as u64;
+        Ok(())
     }
 }
 
@@ -111,28 +192,19 @@ impl Storage for DiskStorage {
     }
 
     fn last_index(&self) -> u64 {
-        self.entries.last().map_or(0, |e| e.index)
+        self.log.last_index()
     }
 
     fn term_at(&self, index: u64) -> Option<u64> {
-        if index == 0 {
-            return Some(0);
-        }
-        self.entry(index).map(|e| e.term)
+        self.log.term_at(index)
     }
 
     fn entry(&self, index: u64) -> Option<&Entry> {
-        if index == 0 {
-            return None;
-        }
-        self.entries.get((index - 1) as usize)
+        self.log.entry(index)
     }
 
     fn entries_from(&self, index: u64) -> Vec<Entry> {
-        if index == 0 || index > self.last_index() {
-            return Vec::new();
-        }
-        self.entries[(index - 1) as usize..].to_vec()
+        self.log.entries_from(index)
     }
 
     fn append(&mut self, entries: &[Entry]) -> Result<()> {
@@ -143,11 +215,6 @@ impl Storage for DiskStorage {
         let mut offsets = Vec::with_capacity(entries.len());
         let mut at = self.end;
         for entry in entries {
-            debug_assert_eq!(
-                entry.index,
-                self.last_index() + offsets.len() as u64 + 1,
-                "entries must be appended in order with no gaps"
-            );
             offsets.push(at);
             let bytes = encode_entry(entry)?;
             at += bytes.len() as u64;
@@ -159,31 +226,66 @@ impl Storage for DiskStorage {
         self.entries_file.sync_all()?;
 
         self.end = at;
-        self.entries.extend_from_slice(entries);
+        for entry in entries {
+            self.log.push(entry.clone());
+        }
         self.offsets.extend_from_slice(&offsets);
         Ok(())
     }
 
     fn truncate_from(&mut self, index: u64) -> Result<()> {
-        if index == 0 || index > self.last_index() {
-            // Index 0 would mean discarding the sentinel, which is not a
-            // thing; past the end there is nothing to discard.
-            if index == 0 {
-                self.entries_file.set_len(0)?;
-                self.entries_file.sync_all()?;
-                self.entries.clear();
-                self.offsets.clear();
-                self.end = 0;
-            }
+        let keep = self.log.truncate_from(index);
+        if keep >= self.offsets.len() {
             return Ok(());
         }
-        let at = self.offsets[(index - 1) as usize];
+        let at = self.offsets[keep];
         self.entries_file.set_len(at)?;
         self.entries_file.sync_all()?;
-        self.entries.truncate((index - 1) as usize);
-        self.offsets.truncate((index - 1) as usize);
+        self.offsets.truncate(keep);
         self.end = at;
         Ok(())
+    }
+
+    fn snapshot_meta(&self) -> SnapshotMeta {
+        self.log.base()
+    }
+
+    fn snapshot_len(&self) -> u64 {
+        self.snapshot_len
+    }
+
+    fn read_snapshot(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        if offset >= self.snapshot_len {
+            return Ok(Vec::new());
+        }
+        let len = (len as u64).min(self.snapshot_len - offset) as usize;
+        let mut file = File::open(self.dir.join("snapshot"))?;
+        file.seek(SeekFrom::Start(SNAPSHOT_HEADER_LEN + offset))?;
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<()> {
+        if meta.index <= self.log.base().index {
+            return Ok(());
+        }
+
+        // The snapshot first, so that the moment the old entries are gone
+        // there is already something durable standing in for them.
+        let mut body = Vec::with_capacity(16 + data.len());
+        body.extend_from_slice(&meta.index.to_le_bytes());
+        body.extend_from_slice(&meta.term.to_le_bytes());
+        body.extend_from_slice(data);
+        let mut file = Vec::with_capacity(4 + body.len());
+        file.extend_from_slice(&crc32_parts(&[&body]).to_le_bytes());
+        file.extend_from_slice(&body);
+        crate::log::write_atomically(&self.dir, "snapshot", &file)?;
+        self.snapshot_len = data.len() as u64;
+
+        // Then the log, cut down to what follows the snapshot.
+        self.log.compact(meta);
+        self.rewrite_entries()
     }
 }
 
@@ -206,14 +308,49 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
     }
 }
 
+/// What the snapshot file covers and how big its data is, checking the
+/// whole file against its checksum on the way.
+///
+/// No file means no snapshot. A file that is there but wrong is not the
+/// same thing at all: the entries it stood in for may already be gone, so
+/// treating it as absent would quietly throw committed writes away.
+fn read_snapshot_header(dir: &Path) -> Result<(SnapshotMeta, u64)> {
+    let bytes = match std::fs::read(dir.join("snapshot")) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((SnapshotMeta::default(), 0)),
+        Err(e) => return Err(e.into()),
+    };
+    let corrupt = |detail| Error::Corrupt {
+        file_id: 0,
+        offset: 0,
+        detail,
+    };
+    if (bytes.len() as u64) < SNAPSHOT_HEADER_LEN {
+        return Err(corrupt("the raft snapshot is shorter than its header"));
+    }
+    let expected = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
+    if crc32_parts(&[&bytes[4..]]) != expected {
+        return Err(corrupt("checksum mismatch in the raft snapshot"));
+    }
+    let index = u64::from_le_bytes(bytes[4..12].try_into().expect("eight bytes"));
+    let term = u64::from_le_bytes(bytes[12..20].try_into().expect("eight bytes"));
+    Ok((
+        SnapshotMeta { index, term },
+        bytes.len() as u64 - SNAPSHOT_HEADER_LEN,
+    ))
+}
+
 /// Read the log back, stopping at the first record that a crash could have
 /// left half-written and truncating the file there.
+///
+/// The entries need not start at index 1, since a snapshot may have taken
+/// the ones before them, but they must follow each other without a gap.
 fn recover(file: &mut File) -> Result<(Vec<Entry>, Vec<u64>, u64)> {
     let size = file.metadata()?.len();
     file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(&mut *file);
 
-    let mut entries = Vec::new();
+    let mut entries: Vec<Entry> = Vec::new();
     let mut offsets = Vec::new();
     let mut at = 0u64;
 
@@ -275,11 +412,19 @@ fn recover(file: &mut File) -> Result<(Vec<Entry>, Vec<u64>, u64)> {
 
         let index = u64::from_le_bytes(key[0..8].try_into().expect("16 byte key"));
         let term = u64::from_le_bytes(key[8..16].try_into().expect("16 byte key"));
-        if index != entries.len() as u64 + 1 {
+        if let Some(last) = entries.last() {
+            if index != last.index + 1 {
+                return Err(Error::Corrupt {
+                    file_id: 0,
+                    offset: at,
+                    detail: "raft log entries are out of order",
+                });
+            }
+        } else if index == 0 {
             return Err(Error::Corrupt {
                 file_id: 0,
                 offset: at,
-                detail: "raft log entries are out of order",
+                detail: "raft log entry has index 0",
             });
         }
 
@@ -597,5 +742,162 @@ mod tests {
             matches!(DiskStorage::open(&dir.0), Err(Error::Corrupt { .. })),
             "a damaged term or vote must not be treated as a fresh node"
         );
+    }
+
+    // -- snapshots ------------------------------------------------------
+
+    fn meta(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta { index, term }
+    }
+
+    #[test]
+    fn a_snapshot_survives_a_reopen() {
+        let dir = Dir::new("snap-reopen");
+        {
+            let mut storage = DiskStorage::open(&dir.0).unwrap();
+            storage
+                .append(&entries(&[(1, 1), (2, 1), (3, 2), (4, 2)]))
+                .unwrap();
+            storage.save_snapshot(meta(3, 2), b"the state").unwrap();
+        }
+        let storage = DiskStorage::open(&dir.0).unwrap();
+        assert_eq!(storage.snapshot_meta(), meta(3, 2));
+        assert_eq!(storage.first_index(), 4);
+        assert_eq!(storage.last_index(), 4);
+        assert_eq!(storage.term_at(3), Some(2));
+        assert_eq!(storage.term_at(2), None);
+        assert_eq!(storage.snapshot_len(), 9);
+        assert_eq!(storage.read_snapshot(0, 100).unwrap(), b"the state");
+        assert_eq!(storage.read_snapshot(4, 3).unwrap(), b"sta");
+    }
+
+    #[test]
+    fn compaction_shrinks_the_entries_file() {
+        let dir = Dir::new("snap-shrink");
+        let mut storage = DiskStorage::open(&dir.0).unwrap();
+        let many: Vec<(u64, u64)> = (1..=50).map(|i| (i, 1)).collect();
+        storage.append(&entries(&many)).unwrap();
+        let before = storage.disk_bytes();
+
+        storage.save_snapshot(meta(45, 1), b"").unwrap();
+        assert!(
+            storage.disk_bytes() < before / 5,
+            "the entries file still holds what the snapshot covers"
+        );
+        // And it is still an ordinary, appendable log.
+        storage.append(&entries(&[(51, 1)])).unwrap();
+        storage.truncate_from(51).unwrap();
+        storage.append(&entries(&[(51, 2)])).unwrap();
+        drop(storage);
+
+        let storage = DiskStorage::open(&dir.0).unwrap();
+        assert_eq!(storage.first_index(), 46);
+        assert_eq!(storage.last_index(), 51);
+        assert_eq!(storage.term_at(51), Some(2));
+    }
+
+    /// The crash the ordering exists for: the snapshot reached disk, but
+    /// the entries file was never cut down. Opening must finish the job.
+    #[test]
+    fn a_crash_between_snapshot_and_rewrite_is_finished_on_open() {
+        let dir = Dir::new("snap-crash");
+        let old_entries;
+        {
+            let mut storage = DiskStorage::open(&dir.0).unwrap();
+            storage
+                .append(&entries(&[(1, 1), (2, 1), (3, 2), (4, 2), (5, 2)]))
+                .unwrap();
+            old_entries = std::fs::read(dir.0.join("entries")).unwrap();
+            storage.save_snapshot(meta(3, 2), b"s").unwrap();
+        }
+        // Put the uncut log back, as if the rewrite never happened.
+        std::fs::write(dir.0.join("entries"), &old_entries).unwrap();
+
+        let storage = DiskStorage::open(&dir.0).unwrap();
+        assert_eq!(storage.first_index(), 4);
+        assert_eq!(storage.last_index(), 5, "the agreeing tail is kept");
+        assert_eq!(storage.entry(3), None);
+        assert!(
+            storage.disk_bytes() < old_entries.len() as u64,
+            "opening should have finished cutting the file down"
+        );
+    }
+
+    /// The same interruption, for a snapshot installed from a leader whose
+    /// log disagreed with this one. None of the old log survives.
+    #[test]
+    fn an_interrupted_install_over_a_diverged_log_discards_it_on_open() {
+        let dir = Dir::new("snap-diverged");
+        let old_entries;
+        {
+            let mut storage = DiskStorage::open(&dir.0).unwrap();
+            storage
+                .append(&entries(&[(1, 1), (2, 1), (3, 1), (4, 1)]))
+                .unwrap();
+            old_entries = std::fs::read(dir.0.join("entries")).unwrap();
+            // The leader's snapshot says index 3 was term 5, not term 1.
+            storage.save_snapshot(meta(3, 5), b"theirs").unwrap();
+        }
+        std::fs::write(dir.0.join("entries"), &old_entries).unwrap();
+
+        let storage = DiskStorage::open(&dir.0).unwrap();
+        assert_eq!(storage.last_index(), 3);
+        assert_eq!(storage.term_at(3), Some(5));
+        assert_eq!(
+            storage.entry(4),
+            None,
+            "an entry after the divergence came back from the dead"
+        );
+    }
+
+    #[test]
+    fn a_damaged_snapshot_is_reported_not_ignored() {
+        let dir = Dir::new("snap-damaged");
+        {
+            let mut storage = DiskStorage::open(&dir.0).unwrap();
+            storage.append(&entries(&[(1, 1), (2, 1)])).unwrap();
+            storage.save_snapshot(meta(2, 1), b"important").unwrap();
+        }
+        let path = dir.0.join("snapshot");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0b0000_0001;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            matches!(DiskStorage::open(&dir.0), Err(Error::Corrupt { .. })),
+            "the entries it stood for are gone, so it cannot be treated as absent"
+        );
+    }
+
+    #[test]
+    fn a_gap_after_the_snapshot_is_reported() {
+        let dir = Dir::new("snap-gap");
+        {
+            let mut storage = DiskStorage::open(&dir.0).unwrap();
+            storage.append(&entries(&[(1, 1), (2, 1)])).unwrap();
+            storage.save_snapshot(meta(2, 1), b"").unwrap();
+        }
+        // An entries file that starts at 5, leaving 3 and 4 unaccounted for.
+        let mut storage = DiskStorage::open(&dir.0).unwrap();
+        storage.log = EntryLog::new(meta(4, 1), Vec::new());
+        storage.append(&entries(&[(5, 1)])).unwrap();
+        drop(storage);
+
+        assert!(matches!(
+            DiskStorage::open(&dir.0),
+            Err(Error::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn an_older_snapshot_is_ignored() {
+        let dir = Dir::new("snap-older");
+        let mut storage = DiskStorage::open(&dir.0).unwrap();
+        storage.append(&entries(&[(1, 1), (2, 1), (3, 1)])).unwrap();
+        storage.save_snapshot(meta(2, 1), b"newer").unwrap();
+        storage.save_snapshot(meta(1, 1), b"older").unwrap();
+        assert_eq!(storage.snapshot_meta(), meta(2, 1));
+        assert_eq!(storage.read_snapshot(0, 10).unwrap(), b"newer");
     }
 }

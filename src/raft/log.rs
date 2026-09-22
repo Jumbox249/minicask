@@ -8,9 +8,17 @@
 //!
 //! So persistence is a trait rather than a detail hidden inside the node.
 //! [`MemStorage`] keeps it in memory, which is enough for the tests to model
-//! a crash (drop the node, keep the storage) and enough to run a cluster.
-//! A disk-backed implementation over the store's own append-only files is
-//! the obvious next one.
+//! a crash (drop the node, keep the storage). [`DiskStorage`] is what a
+//! real node uses.
+//!
+//! A log does not have to start at index 1. Once a prefix of it has been
+//! folded into a snapshot it is discarded, and the log begins just after
+//! the snapshot, whose last index and term stand in for the entries that
+//! are gone. With no snapshot that stand-in is index 0 at term 0, which is
+//! the same sentinel the very first `AppendEntries` matches against, so the
+//! two cases are one case.
+//!
+//! [`DiskStorage`]: super::DiskStorage
 
 use crate::error::Result;
 
@@ -66,27 +74,39 @@ pub struct HardState {
     pub voted_for: Option<NodeId>,
 }
 
+/// What a snapshot covers: the index and term of the last entry folded
+/// into it. The log resumes at `index + 1`.
+///
+/// The default, zero and zero, means there is no snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SnapshotMeta {
+    pub index: u64,
+    pub term: u64,
+}
+
 /// Durable storage for one node's consensus state.
 ///
-/// Indices are 1-based. Index 0 is a sentinel that always exists and always
-/// has term 0, which is what makes the very first `AppendEntries` match
-/// without a special case.
+/// Indices are 1-based, and everything at or below the snapshot's index has
+/// been discarded except the snapshot's own index and term.
 pub trait Storage {
     fn hard_state(&self) -> HardState;
 
     /// Must not return until the state is durable.
     fn save_hard_state(&mut self, state: HardState) -> Result<()>;
 
-    /// The highest index in the log, or 0 when it is empty.
+    /// The highest index in the log. When nothing follows the snapshot,
+    /// that is the snapshot's index, and 0 when there is neither.
     fn last_index(&self) -> u64;
 
-    /// The term of the entry at `index`, or `None` if there is no such
-    /// entry. Index 0 is term 0.
+    /// The term of the entry at `index`. The snapshot's index answers with
+    /// the snapshot's term; anything below it has been discarded and
+    /// answers `None`, as does anything past the end.
     fn term_at(&self, index: u64) -> Option<u64>;
 
+    /// An entry still held in the log. Never one folded into a snapshot.
     fn entry(&self, index: u64) -> Option<&Entry>;
 
-    /// Every entry from `index` onwards.
+    /// Every entry still held from `index` onwards.
     fn entries_from(&self, index: u64) -> Vec<Entry>;
 
     /// Append entries to the end of the log. Must not return until they are
@@ -95,12 +115,38 @@ pub trait Storage {
 
     /// Discard the entry at `index` and everything after it. Only ever
     /// called on entries that conflict with the leader's log, which by
-    /// Raft's rules cannot have been committed.
+    /// Raft's rules cannot have been committed, and so cannot be in a
+    /// snapshot either.
     fn truncate_from(&mut self, index: u64) -> Result<()>;
+
+    /// What the current snapshot covers.
+    fn snapshot_meta(&self) -> SnapshotMeta;
+
+    /// The size of the current snapshot's data in bytes.
+    fn snapshot_len(&self) -> u64;
+
+    /// Up to `len` bytes of the snapshot's data, starting at `offset`.
+    fn read_snapshot(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
+
+    /// Replace the snapshot with a newer one and drop the entries it
+    /// covers. Must not return until durable.
+    ///
+    /// If the log holds the snapshot's last entry, at the same term, the
+    /// entries after it are kept: they agree with whoever produced the
+    /// snapshot. Otherwise the whole log is discarded, because it has
+    /// diverged from the snapshot and none of it can be trusted.
+    ///
+    /// A snapshot no newer than the current one changes nothing.
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<()>;
 }
 
 /// Convenience queries that every `Storage` gets for free.
 pub trait StorageExt: Storage {
+    /// The first index still held as an entry.
+    fn first_index(&self) -> u64 {
+        self.snapshot_meta().index + 1
+    }
+
     fn last_term(&self) -> u64 {
         self.term_at(self.last_index()).unwrap_or(0)
     }
@@ -113,17 +159,17 @@ pub trait StorageExt: Storage {
         last_term > my_term || (last_term == my_term && last_index >= self.last_index())
     }
 
-    /// The first index belonging to `term`, used to tell a leader how far
-    /// back to rewind after a mismatch.
+    /// The first index still held that belongs to `term`, used to tell a
+    /// leader how far back to rewind after a mismatch.
+    ///
+    /// A term that began inside the snapshot reports the first entry after
+    /// it. That can only be too late, never too early, and a hint that is
+    /// too late costs a round trip rather than correctness.
     fn first_index_of_term(&self, term: u64) -> u64 {
-        let mut index = 1;
-        for i in 1..=self.last_index() {
-            if self.term_at(i) == Some(term) {
-                index = i;
-                break;
-            }
-        }
-        index
+        let first = self.first_index();
+        (first..=self.last_index())
+            .find(|&i| self.term_at(i) == Some(term))
+            .unwrap_or(first)
     }
 
     /// Entries from `index` onwards, stopping before the total would pass
@@ -135,7 +181,7 @@ pub trait StorageExt: Storage {
     fn entries_within(&self, index: u64, max_bytes: usize) -> Vec<Entry> {
         let mut out = Vec::new();
         let mut total = 0usize;
-        for i in index.max(1)..=self.last_index() {
+        for i in index.max(self.first_index())..=self.last_index() {
             let Some(entry) = self.entry(i) else { break };
             let len = entry.encoded_len();
             if !out.is_empty() && total + len > max_bytes {
@@ -148,15 +194,119 @@ pub trait StorageExt: Storage {
     }
 
     /// The last index belonging to `term`, or `None` if the log has no
-    /// entry from it.
+    /// entry from it. The snapshot's own index counts.
     fn last_index_of_term(&self, term: u64) -> Option<u64> {
-        (1..=self.last_index())
+        (self.snapshot_meta().index..=self.last_index())
             .rev()
-            .find(|&i| self.term_at(i) == Some(term))
+            .find(|&i| i > 0 && self.term_at(i) == Some(term))
     }
 }
 
 impl<S: Storage + ?Sized> StorageExt for S {}
+
+/// The in-memory part of a log: the entries after the snapshot, and the
+/// snapshot's index and term standing in for everything before them.
+///
+/// Both storages keep one of these. Keeping the index arithmetic in one
+/// place is the point: an off-by-one between two copies of it is exactly
+/// the kind of bug a consensus log cannot afford.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EntryLog {
+    base: SnapshotMeta,
+    entries: Vec<Entry>,
+}
+
+impl EntryLog {
+    pub(crate) fn new(base: SnapshotMeta, entries: Vec<Entry>) -> EntryLog {
+        debug_assert!(
+            entries
+                .iter()
+                .enumerate()
+                .all(|(i, e)| e.index == base.index + 1 + i as u64),
+            "entries must follow the snapshot with no gaps"
+        );
+        EntryLog { base, entries }
+    }
+
+    pub(crate) fn base(&self) -> SnapshotMeta {
+        self.base
+    }
+
+    pub(crate) fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub(crate) fn last_index(&self) -> u64 {
+        self.entries.last().map_or(self.base.index, |e| e.index)
+    }
+
+    /// Where `index` sits in `entries`, if it is held at all.
+    pub(crate) fn position(&self, index: u64) -> Option<usize> {
+        if index <= self.base.index || index > self.last_index() {
+            return None;
+        }
+        Some((index - self.base.index - 1) as usize)
+    }
+
+    pub(crate) fn term_at(&self, index: u64) -> Option<u64> {
+        if index == self.base.index {
+            return Some(self.base.term);
+        }
+        self.entry(index).map(|e| e.term)
+    }
+
+    pub(crate) fn entry(&self, index: u64) -> Option<&Entry> {
+        self.position(index).map(|p| &self.entries[p])
+    }
+
+    pub(crate) fn entries_from(&self, index: u64) -> Vec<Entry> {
+        let start = index.max(self.base.index + 1);
+        match self.position(start) {
+            Some(p) => self.entries[p..].to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, entry: Entry) {
+        debug_assert_eq!(
+            entry.index,
+            self.last_index() + 1,
+            "entries must be appended in order with no gaps"
+        );
+        self.entries.push(entry);
+    }
+
+    /// Drop `index` and everything after it. Returns how many entries are
+    /// left, which is also the position the next entry will occupy.
+    pub(crate) fn truncate_from(&mut self, index: u64) -> usize {
+        let keep = if index <= self.base.index {
+            0
+        } else {
+            ((index - self.base.index - 1) as usize).min(self.entries.len())
+        };
+        self.entries.truncate(keep);
+        keep
+    }
+
+    /// Fold everything up to `meta.index` into a snapshot, keeping what
+    /// follows only if it agrees with the snapshot. See
+    /// [`Storage::save_snapshot`]. Returns false when `meta` is no newer
+    /// than what is already here.
+    pub(crate) fn compact(&mut self, meta: SnapshotMeta) -> bool {
+        if meta.index <= self.base.index {
+            return false;
+        }
+        let kept = if self.term_at(meta.index) == Some(meta.term) {
+            let from = (meta.index - self.base.index) as usize;
+            self.entries.split_off(from)
+        } else {
+            Vec::new()
+        };
+        self.base = meta;
+        self.entries = kept;
+        true
+    }
+}
 
 /// An in-memory `Storage`. Surviving a process restart is not something it
 /// can do, but surviving a *node* restart is: the test harness drops the
@@ -165,7 +315,8 @@ impl<S: Storage + ?Sized> StorageExt for S {}
 #[derive(Debug, Clone, Default)]
 pub struct MemStorage {
     hard_state: HardState,
-    entries: Vec<Entry>,
+    log: EntryLog,
+    snapshot: Vec<u8>,
 }
 
 impl MemStorage {
@@ -185,47 +336,50 @@ impl Storage for MemStorage {
     }
 
     fn last_index(&self) -> u64 {
-        self.entries.last().map_or(0, |e| e.index)
+        self.log.last_index()
     }
 
     fn term_at(&self, index: u64) -> Option<u64> {
-        if index == 0 {
-            return Some(0);
-        }
-        self.entry(index).map(|e| e.term)
+        self.log.term_at(index)
     }
 
     fn entry(&self, index: u64) -> Option<&Entry> {
-        if index == 0 {
-            return None;
-        }
-        self.entries.get((index - 1) as usize)
+        self.log.entry(index)
     }
 
     fn entries_from(&self, index: u64) -> Vec<Entry> {
-        if index == 0 || index > self.last_index() {
-            return Vec::new();
-        }
-        self.entries[(index - 1) as usize..].to_vec()
+        self.log.entries_from(index)
     }
 
     fn append(&mut self, entries: &[Entry]) -> Result<()> {
         for entry in entries {
-            debug_assert_eq!(
-                entry.index,
-                self.last_index() + 1,
-                "entries must be appended in order with no gaps"
-            );
-            self.entries.push(entry.clone());
+            self.log.push(entry.clone());
         }
         Ok(())
     }
 
     fn truncate_from(&mut self, index: u64) -> Result<()> {
-        if index == 0 {
-            self.entries.clear();
-        } else if index <= self.last_index() {
-            self.entries.truncate((index - 1) as usize);
+        self.log.truncate_from(index);
+        Ok(())
+    }
+
+    fn snapshot_meta(&self) -> SnapshotMeta {
+        self.log.base()
+    }
+
+    fn snapshot_len(&self) -> u64 {
+        self.snapshot.len() as u64
+    }
+
+    fn read_snapshot(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let start = (offset as usize).min(self.snapshot.len());
+        let end = start.saturating_add(len).min(self.snapshot.len());
+        Ok(self.snapshot[start..end].to_vec())
+    }
+
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<()> {
+        if self.log.compact(meta) {
+            self.snapshot = data.to_vec();
         }
         Ok(())
     }
@@ -339,5 +493,109 @@ mod tests {
             !s.is_up_to_date(99, 2),
             "an earlier term loses at any length"
         );
+    }
+
+    // -- snapshots ------------------------------------------------------
+
+    fn meta(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta { index, term }
+    }
+
+    #[test]
+    fn compaction_drops_the_prefix_and_keeps_its_last_term() {
+        let mut s = filled();
+        s.save_snapshot(meta(3, 2), b"state").unwrap();
+
+        assert_eq!(s.snapshot_meta(), meta(3, 2));
+        assert_eq!(s.first_index(), 4);
+        assert_eq!(s.last_index(), 5, "the tail is untouched");
+        assert_eq!(s.term_at(3), Some(2), "the snapshot answers for its index");
+        assert_eq!(s.term_at(2), None, "below the snapshot is gone");
+        assert_eq!(s.entry(3), None, "the snapshot's index is not an entry");
+        assert_eq!(s.entry(4).map(|e| e.index), Some(4));
+        assert_eq!(s.read_snapshot(0, 100).unwrap(), b"state");
+    }
+
+    #[test]
+    fn a_log_after_a_snapshot_still_appends_and_truncates() {
+        let mut s = filled();
+        s.save_snapshot(meta(3, 2), b"").unwrap();
+        s.append(&[entry(6, 4)]).unwrap();
+        assert_eq!(s.last_index(), 6);
+        s.truncate_from(5).unwrap();
+        assert_eq!(s.last_index(), 4);
+        assert_eq!(s.entries_from(1).len(), 1, "only index 4 is left");
+    }
+
+    #[test]
+    fn compacting_everything_leaves_the_snapshot_as_the_log_end() {
+        let mut s = filled();
+        s.save_snapshot(meta(5, 3), b"").unwrap();
+        assert_eq!(s.last_index(), 5);
+        assert_eq!(s.last_term(), 3, "votes still see the right last term");
+        assert!(s.entries_from(1).is_empty());
+        s.append(&[entry(6, 3)]).unwrap();
+        assert_eq!(s.first_index(), 6);
+    }
+
+    #[test]
+    fn a_snapshot_that_disagrees_with_the_log_discards_all_of_it() {
+        let mut s = filled();
+        // Index 4 here is term 3; a snapshot says it was term 7.
+        s.save_snapshot(meta(4, 7), b"theirs").unwrap();
+        assert_eq!(s.last_index(), 4);
+        assert_eq!(s.term_at(4), Some(7));
+        assert_eq!(
+            s.entry(5),
+            None,
+            "an entry after a mismatch cannot be trusted"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_past_the_end_of_the_log_replaces_it() {
+        let mut s = filled();
+        s.save_snapshot(meta(40, 9), b"far ahead").unwrap();
+        assert_eq!(s.last_index(), 40);
+        assert_eq!(s.first_index(), 41);
+        assert!(s.entries_from(1).is_empty());
+    }
+
+    #[test]
+    fn an_older_snapshot_changes_nothing() {
+        let mut s = filled();
+        s.save_snapshot(meta(4, 3), b"new").unwrap();
+        s.save_snapshot(meta(2, 1), b"old").unwrap();
+        assert_eq!(s.snapshot_meta(), meta(4, 3));
+        assert_eq!(s.read_snapshot(0, 10).unwrap(), b"new");
+        assert_eq!(s.last_index(), 5, "and the log is untouched");
+    }
+
+    #[test]
+    fn a_snapshot_reads_back_in_pieces() {
+        let mut s = filled();
+        s.save_snapshot(meta(2, 1), b"0123456789").unwrap();
+        assert_eq!(s.snapshot_len(), 10);
+        assert_eq!(s.read_snapshot(0, 4).unwrap(), b"0123");
+        assert_eq!(s.read_snapshot(4, 4).unwrap(), b"4567");
+        assert_eq!(s.read_snapshot(8, 4).unwrap(), b"89");
+        assert!(s.read_snapshot(10, 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn term_hints_stay_inside_what_is_held() {
+        let mut s = filled();
+        s.save_snapshot(meta(3, 2), b"").unwrap();
+        assert_eq!(
+            s.first_index_of_term(1),
+            4,
+            "a term inside the snapshot reports the first held entry"
+        );
+        assert_eq!(
+            s.last_index_of_term(2),
+            Some(3),
+            "the snapshot's term counts"
+        );
+        assert_eq!(s.last_index_of_term(1), None);
     }
 }

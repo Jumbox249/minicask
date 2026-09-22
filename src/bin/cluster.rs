@@ -27,6 +27,8 @@ OPTIONS:
     --client ADDR       Address to listen on for Redis clients
     --peer SPEC         A peer, as ID@RAFT_ADDR,CLIENT_ADDR; repeat per peer
     --tick-ms N         Milliseconds per consensus tick (default: 50)
+    --snapshot-every N  Applied entries between snapshots, 0 for never
+                        (default: 10000)
     -h, --help          Print this message
 
 A cluster of three tolerates one node being down; a cluster of five
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
     let mut client_addr = None;
     let mut peers = Vec::new();
     let mut tick_ms = 50u64;
+    let mut snapshot_every = minicask::DEFAULT_SNAPSHOT_EVERY;
 
     while let Some(arg) = args.next() {
         let mut value = |what: &str| match args.next() {
@@ -60,6 +63,11 @@ fn main() -> ExitCode {
                 v.parse::<u64>()
                     .map(|n| tick_ms = n)
                     .map_err(|_| "--tick-ms must be a number".to_string())
+            }),
+            "--snapshot-every" => value("--snapshot-every").and_then(|v| {
+                v.parse::<u64>()
+                    .map(|n| snapshot_every = n)
+                    .map_err(|_| "--snapshot-every must be a number".to_string())
             }),
             "--peer" => value("--peer").and_then(|v| parse_peer(&v).map(|p| peers.push(p))),
             "-h" | "--help" => {
@@ -90,6 +98,7 @@ fn main() -> ExitCode {
         peers,
         tick_ms,
         raft: Config::default(),
+        snapshot_every,
     };
 
     let node = match ClusterNode::bind(

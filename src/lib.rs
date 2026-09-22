@@ -34,6 +34,6 @@ mod store;
 pub use cluster::{ClusterConfig, ClusterNode, Peer};
 pub use error::{Error, Result};
 pub use log::SyncPolicy;
-pub use replicated::{Op, ReplicatedStore};
+pub use replicated::{Op, ReplicatedStore, DEFAULT_SNAPSHOT_EVERY};
 pub use server::Server;
 pub use store::{CompactReport, Location, Options, Stats, Store};

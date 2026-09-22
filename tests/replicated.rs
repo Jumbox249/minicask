@@ -9,7 +9,7 @@
 mod common;
 
 use common::TempDir;
-use minicask::raft::{Action, Config, DiskStorage, Node, NodeId};
+use minicask::raft::{Action, Config, DiskStorage, Message, Node, NodeId, StorageExt};
 use minicask::{ReplicatedStore, Store};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -29,14 +29,18 @@ struct Cluster {
     config: Config,
     inflight: Vec<InFlight>,
     severed: HashSet<(NodeId, NodeId)>,
+    snapshot_every: u64,
     _root: TempDir,
 }
 
 impl Cluster {
     fn new(size: u64) -> Cluster {
+        Cluster::with_snapshots(size, Config::default(), minicask::DEFAULT_SNAPSHOT_EVERY)
+    }
+
+    fn with_snapshots(size: u64, config: Config, snapshot_every: u64) -> Cluster {
         let root = TempDir::new("replicated");
         let ids: Vec<NodeId> = (1..=size).collect();
-        let config = Config::default();
         let mut nodes = HashMap::new();
         let mut dirs = HashMap::new();
 
@@ -44,7 +48,17 @@ impl Cluster {
             let raft_dir = root.path().join(format!("node-{id}/raft"));
             let store_dir = root.path().join(format!("node-{id}/data"));
             dirs.insert(id, (raft_dir.clone(), store_dir.clone()));
-            nodes.insert(id, Some(open(id, &ids, config, &raft_dir, &store_dir)));
+            nodes.insert(
+                id,
+                Some(open(
+                    id,
+                    &ids,
+                    config,
+                    snapshot_every,
+                    &raft_dir,
+                    &store_dir,
+                )),
+            );
         }
 
         Cluster {
@@ -54,6 +68,7 @@ impl Cluster {
             config,
             inflight: Vec::new(),
             severed: HashSet::new(),
+            snapshot_every,
             _root: root,
         }
     }
@@ -129,7 +144,14 @@ impl Cluster {
     fn restart(&mut self, id: NodeId) {
         self.kill(id);
         let (raft_dir, store_dir) = self.dirs[&id].clone();
-        let node = open(id, &self.ids, self.config, &raft_dir, &store_dir);
+        let node = open(
+            id,
+            &self.ids,
+            self.config,
+            self.snapshot_every,
+            &raft_dir,
+            &store_dir,
+        );
         self.nodes.insert(id, Some(node));
     }
 
@@ -245,10 +267,20 @@ impl Cluster {
     }
 }
 
-fn open(id: NodeId, ids: &[NodeId], config: Config, raft_dir: &Path, store_dir: &Path) -> Replica {
+fn open(
+    id: NodeId,
+    ids: &[NodeId],
+    config: Config,
+    snapshot_every: u64,
+    raft_dir: &Path,
+    store_dir: &Path,
+) -> Replica {
     let storage = DiskStorage::open(raft_dir).expect("open the raft log");
     let store = Store::open(store_dir).expect("open the store");
-    ReplicatedStore::new(Node::new(id, ids.to_vec(), config, storage), store)
+    let mut replica = ReplicatedStore::new(Node::new(id, ids.to_vec(), config, storage), store)
+        .expect("join the node to its store");
+    replica.set_snapshot_every(snapshot_every);
+    replica
 }
 
 fn queue(out: &mut Vec<InFlight>, from: NodeId, actions: Vec<Action>) {
@@ -798,4 +830,327 @@ fn a_missing_or_damaged_applied_index_only_costs_a_replay() {
         );
         c.assert_all_agree();
     }
+}
+
+// -- snapshots ----------------------------------------------------------
+
+impl Cluster {
+    /// Every `AppendEntries`-sized piece of snapshot currently in flight to
+    /// `id`.
+    fn snapshot_pieces_to(&self, id: NodeId) -> usize {
+        self.inflight
+            .iter()
+            .filter(|m| m.to == id && matches!(m.message, Message::InstallSnapshot { .. }))
+            .count()
+    }
+
+    /// Strand `behind` and write enough past it that the leader compacts
+    /// away every entry it would need. Returns the leader.
+    fn leave_behind(&mut self, behind: NodeId, writes: u8) -> NodeId {
+        let leader = self.leader().expect("a leader");
+        assert_ne!(leader, behind);
+        let rest: Vec<NodeId> = self
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != behind)
+            .collect();
+        self.partition(&[&rest, &[behind]]);
+        for i in 0..writes {
+            self.put(leader, &[b'f', i], &[b'v', i]);
+            self.tick();
+        }
+        self.run_until("the majority to apply", |c| {
+            rest.iter()
+                .all(|&id| c.node(id).applied_index() >= c.node(leader).node().last_index())
+        });
+        assert!(
+            self.node(leader).snapshot_index() > self.node(behind).node().last_index(),
+            "the leader should have compacted past everything the straggler holds"
+        );
+        leader
+    }
+}
+
+#[test]
+fn the_log_is_compacted_as_it_grows() {
+    let mut c = Cluster::with_snapshots(3, Config::default(), 10);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    for i in 0..60u8 {
+        c.put(leader, &[b'k', i], &[b'v'; 32]);
+        c.tick();
+    }
+    c.settle();
+
+    for id in 1..=3 {
+        let node = c.node(id);
+        assert!(node.snapshot_index() >= 50, "node {id} never compacted");
+        assert!(
+            node.node().storage().first_index() > 50,
+            "node {id} is still holding entries its snapshot covers"
+        );
+        assert_eq!(node.len(), 60, "node {id} lost data to compaction");
+    }
+    c.assert_all_agree();
+}
+
+/// The reason snapshots have to be sendable: a follower that is behind by
+/// more than the leader still has as entries can only be caught up with
+/// the state itself.
+#[test]
+fn a_follower_behind_the_leaders_log_is_caught_up_by_snapshot() {
+    let mut c = Cluster::with_snapshots(3, Config::default(), 10);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let behind = (1..=3).find(|&id| Some(id) != c.leader()).unwrap();
+    let leader = c.leave_behind(behind, 50);
+
+    c.heal();
+    let mut saw_snapshot = false;
+    for _ in 0..600 {
+        saw_snapshot |= c.snapshot_pieces_to(behind) > 0;
+        if c.node(behind).applied_index() >= c.node(leader).node().last_index() {
+            break;
+        }
+        c.tick();
+    }
+    assert!(saw_snapshot, "the straggler was never sent a snapshot");
+    assert!(c.node(behind).snapshot_index() > 0);
+    c.settle();
+    assert_eq!(c.contents(behind), c.contents(leader));
+    c.assert_all_agree();
+}
+
+/// The hazard in restoring a snapshot. Writing the snapshot's keys over
+/// the store is not enough: a key this node still has, but the cluster
+/// deleted while it was away, is simply absent from the snapshot, and
+/// would survive a restore that only ever writes.
+#[test]
+fn a_key_deleted_while_away_does_not_come_back() {
+    let mut c = Cluster::with_snapshots(3, Config::default(), 10);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    c.put(leader, b"kept", b"1");
+    c.put(leader, b"deleted", b"2");
+    c.put(leader, b"changed", b"3");
+    c.settle();
+
+    let behind = (1..=3).find(|&id| id != leader).unwrap();
+    assert_eq!(c.node(behind).get(b"deleted").unwrap(), Some(b"2".to_vec()));
+
+    let rest: Vec<NodeId> = (1..=3).filter(|&id| id != behind).collect();
+    c.partition(&[&rest, &[behind]]);
+    c.delete(leader, b"deleted");
+    c.put(leader, b"changed", b"new");
+    c.put(leader, b"added", b"4");
+    c.leave_behind(behind, 40);
+
+    c.heal();
+    c.settle();
+    assert_eq!(
+        c.node(behind).get(b"deleted").unwrap(),
+        None,
+        "a key deleted by the cluster came back on the node that missed the delete"
+    );
+    assert_eq!(
+        c.node(behind).get(b"changed").unwrap(),
+        Some(b"new".to_vec())
+    );
+    assert_eq!(c.node(behind).get(b"added").unwrap(), Some(b"4".to_vec()));
+    assert_eq!(c.node(behind).get(b"kept").unwrap(), Some(b"1".to_vec()));
+    c.assert_all_agree();
+}
+
+#[test]
+fn a_large_snapshot_travels_in_many_pieces() {
+    let config = Config {
+        max_append_bytes: 256,
+        ..Config::default()
+    };
+    let mut c = Cluster::with_snapshots(3, config, 10);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let behind = (1..=3).find(|&id| Some(id) != c.leader()).unwrap();
+    let leader = c.leave_behind(behind, 40);
+
+    c.heal();
+    let mut pieces = 0;
+    for _ in 0..2000 {
+        for m in &c.inflight {
+            if let Message::InstallSnapshot { data, .. } = &m.message {
+                if m.to == behind {
+                    pieces += 1;
+                    assert!(data.len() <= 256, "a snapshot piece went over the budget");
+                }
+            }
+        }
+        if c.node(behind).applied_index() >= c.node(leader).node().last_index() {
+            break;
+        }
+        c.tick();
+    }
+    assert!(
+        pieces > 3,
+        "only {pieces} pieces: the snapshot was not split up"
+    );
+    c.settle();
+    c.assert_all_agree();
+}
+
+#[test]
+fn a_restart_after_compaction_comes_back_whole() {
+    let mut c = Cluster::with_snapshots(3, Config::default(), 10);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    for i in 0..35u8 {
+        c.put(leader, &[b'k', i], &[b'v', i]);
+        c.tick();
+    }
+    c.delete(leader, &[b'k', 3]);
+    c.settle();
+    let expected = c.contents(leader);
+
+    let follower = (1..=3).find(|&id| id != leader).unwrap();
+    c.restart(follower);
+    assert_eq!(
+        c.contents(follower),
+        expected,
+        "the restart lost or revived data"
+    );
+
+    for id in 1..=3 {
+        c.restart(id);
+    }
+    c.run_until("a leader after the bounce", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    c.put(leader, b"after", b"bounce");
+    c.settle();
+    assert_eq!(
+        c.node(leader).get(b"after").unwrap(),
+        Some(b"bounce".to_vec())
+    );
+    c.assert_all_agree();
+}
+
+/// A crash while the store was being brought up to a snapshot, or before
+/// it started, leaves the snapshot ahead of the store. The store may be in
+/// any state at all by then, so the next start has to make it exactly the
+/// snapshot again rather than trust any of it.
+#[test]
+fn an_unfinished_restore_is_completed_on_restart() {
+    let mut c = Cluster::with_snapshots(3, Config::default(), 10);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    for i in 0..25u8 {
+        c.put(leader, &[b'k', i], &[b'v', i]);
+        c.tick();
+    }
+    c.settle();
+    let follower = (1..=3).find(|&id| id != leader).unwrap();
+    assert!(c.node(follower).snapshot_index() > 0);
+    let expected = c.contents(follower);
+
+    // Down, and its store left half-way: a key that should not be there,
+    // one missing, and no record of how far it had got.
+    c.kill(follower);
+    let store_dir = c.store_dir(follower);
+    {
+        let mut store = Store::open(&store_dir).expect("open the store directly");
+        store.put(b"junk", b"from a half-done restore").unwrap();
+        store.delete(&[b'k', 4]).unwrap();
+    }
+    std::fs::remove_file(store_dir.join("applied-index")).expect("remove the index");
+
+    c.restart(follower);
+    // Straight away, before it has heard from anyone, the store must be
+    // exactly the snapshot again: the stray key gone, the lost one back.
+    assert_eq!(
+        c.node(follower).get(b"junk").unwrap(),
+        None,
+        "a key the snapshot does not have survived the restore"
+    );
+    assert_eq!(
+        c.node(follower).get(&[b'k', 4]).unwrap(),
+        Some(vec![b'v', 4]),
+        "a key the snapshot has was not put back"
+    );
+    assert_eq!(
+        c.node(follower).applied_index(),
+        c.node(follower).snapshot_index(),
+        "the store should stand exactly at the snapshot"
+    );
+
+    // The entries after the snapshot follow once it relearns what is
+    // committed, which needs the leader.
+    c.settle();
+    assert_eq!(c.contents(follower), expected);
+    c.assert_all_agree();
+}
+
+#[test]
+fn the_data_stays_consistent_under_churn_with_snapshots() {
+    let mut c = Cluster::with_snapshots(5, Config::default(), 5);
+    c.run_until("a leader", |c| c.leader().is_some());
+
+    let mut expected: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    for round in 0..15u8 {
+        c.run_until("a leader", |c| c.leader().is_some());
+        let leader = c.leader().expect("a leader");
+        for i in 0..4u8 {
+            let key = vec![b'k', round, i];
+            let value = vec![b'v', round, i];
+            c.put(leader, &key, &value);
+            expected.insert(key, value);
+        }
+        if round >= 1 {
+            let victim = vec![b'k', round - 1, 0];
+            c.delete(leader, &victim);
+            expected.remove(&victim);
+        }
+        c.run_until("the round to apply", |c| {
+            c.node(leader).applied_index() >= c.node(leader).node().last_index()
+        });
+
+        match round % 3 {
+            0 => {
+                // Strand one follower for long enough to fall behind the
+                // snapshot, so it has to be caught up by one.
+                let away = (1..=5).find(|&id| id != leader).unwrap();
+                let rest: Vec<NodeId> = (1..=5).filter(|&id| id != away).collect();
+                c.partition(&[&rest, &[away]]);
+                for i in 0..12u8 {
+                    let key = vec![b'p', round, i];
+                    c.put(leader, &key, b"x");
+                    expected.insert(key, b"x".to_vec());
+                    c.tick();
+                }
+                c.run_until("the majority to apply", |c| {
+                    rest.iter()
+                        .all(|&id| c.node(id).applied_index() >= c.node(leader).node().last_index())
+                });
+                c.heal();
+            }
+            1 => {
+                c.kill(leader);
+                c.run_until("a replacement", |c| c.leader().is_some());
+                c.restart(leader);
+            }
+            _ => {
+                let victim = (1..=5).find(|&id| id != leader).unwrap();
+                c.restart(victim);
+                c.tick_n(20);
+            }
+        }
+        c.run_until("the cluster to settle", |c| c.leader().is_some());
+    }
+
+    c.settle();
+    c.assert_all_agree();
+    let mut wanted: Vec<(Vec<u8>, Vec<u8>)> = expected.into_iter().collect();
+    wanted.sort();
+    let leader = c.leader().expect("a leader");
+    assert!(
+        c.node(leader).snapshot_index() > 0,
+        "no snapshot was ever taken"
+    );
+    assert_eq!(c.contents(leader), wanted);
 }

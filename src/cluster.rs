@@ -58,6 +58,9 @@ pub struct ClusterConfig {
     /// [`Config`] are counted in these.
     pub tick_ms: u64,
     pub raft: Config,
+    /// Applied entries between snapshots; see
+    /// [`ReplicatedStore::set_snapshot_every`].
+    pub snapshot_every: u64,
 }
 
 impl ClusterConfig {
@@ -155,7 +158,8 @@ impl ClusterNode {
         let storage = DiskStorage::open(raft_dir)?;
         let store = Store::open(store_dir)?;
         let node = Node::new(config.id, config.ids(), config.raft, storage);
-        let replica = ReplicatedStore::new(node, store);
+        let mut replica = ReplicatedStore::new(node, store)?;
+        replica.set_snapshot_every(config.snapshot_every);
 
         let raft_listener = TcpListener::bind(raft_addr)?;
         let client_listener = TcpListener::bind(client_addr)?;
@@ -420,7 +424,7 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
             let node = replica.node();
             Reply::Bulk(
                 format!(
-                    "id:{}\r\nrole:{}\r\nterm:{}\r\nleader:{}\r\ncommit_index:{}\r\napplied_index:{}\r\nlast_index:{}\r\nkeys:{}\r\n",
+                    "id:{}\r\nrole:{}\r\nterm:{}\r\nleader:{}\r\ncommit_index:{}\r\napplied_index:{}\r\nlast_index:{}\r\nsnapshot_index:{}\r\nkeys:{}\r\n",
                     node.id(),
                     match node.role() {
                         Role::Leader => "leader",
@@ -433,6 +437,7 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
                     node.commit_index(),
                     replica.applied_index(),
                     node.last_index(),
+                    replica.snapshot_index(),
                     replica.len(),
                 )
                 .into_bytes(),

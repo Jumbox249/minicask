@@ -6,7 +6,7 @@
 //! a function of the state and the input, which is what lets the test
 //! harness partition a cluster and kill leaders without a single sleep.
 
-use super::log::{Command, Entry, HardState, NodeId, Storage, StorageExt};
+use super::log::{Command, Entry, HardState, NodeId, SnapshotMeta, Storage, StorageExt};
 use super::message::{Action, Message};
 use crate::error::Result;
 use std::collections::{HashMap, HashSet};
@@ -169,6 +169,13 @@ pub struct Node<S: Storage> {
     /// Peers heard from since the last quorum check. A leader that cannot
     /// find a majority in here has been cut off and stands down.
     active: HashSet<NodeId>,
+    /// Leader only: for each follower being sent a snapshot, which snapshot
+    /// (by its last index) and how far into it the follower has got.
+    snapshot_progress: HashMap<NodeId, (u64, u64)>,
+    /// Follower only: a snapshot arriving in pieces, and who is sending it.
+    /// Pieces from two leaders are never spliced, even for the same index:
+    /// both describe the same state, but nothing promises the same bytes.
+    incoming: Option<(NodeId, SnapshotMeta, Vec<u8>)>,
     next_index: HashMap<NodeId, u64>,
     match_index: HashMap<NodeId, u64>,
 
@@ -185,6 +192,7 @@ impl<S: Storage> Node<S> {
     /// it had before, which is what stops a restart from being a second
     /// vote in the same term.
     pub fn new(id: NodeId, peers: Vec<NodeId>, config: Config, storage: S) -> Node<S> {
+        let snapshot = storage.snapshot_meta().index;
         let mut rng = Rng::new(id);
         let election_timeout = random_timeout(&mut rng, &config);
         Node {
@@ -194,11 +202,16 @@ impl<S: Storage> Node<S> {
             storage,
             role: Role::Follower,
             leader_id: None,
-            commit_index: 0,
-            last_applied: 0,
+            // A snapshot only ever holds applied state, and applied state
+            // is committed, so a restart can start from there rather than
+            // from nothing.
+            commit_index: snapshot,
+            last_applied: snapshot,
             votes: HashSet::new(),
             leader_start: 0,
             active: HashSet::new(),
+            snapshot_progress: HashMap::new(),
+            incoming: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             election_elapsed: 0,
@@ -306,6 +319,26 @@ impl<S: Storage> Node<S> {
             }
         }
         Ok(actions)
+    }
+
+    /// Fold the log up to `index` into a snapshot, and discard the entries
+    /// it covers.
+    ///
+    /// `data` is the caller's state machine as of `index`, which is why
+    /// only applied state can be snapshotted: that is the only state the
+    /// caller can describe. Returns whether anything was compacted; asking
+    /// for an index that is not applied yet, or not past the current
+    /// snapshot, does nothing.
+    pub fn compact(&mut self, index: u64, data: &[u8]) -> Result<bool> {
+        if index <= self.storage.snapshot_meta().index || index > self.last_applied {
+            return Ok(false);
+        }
+        let Some(term) = self.storage.term_at(index) else {
+            return Ok(false);
+        };
+        self.storage
+            .save_snapshot(SnapshotMeta { index, term }, data)?;
+        Ok(true)
     }
 
     /// Stand for election now, skipping the pre-vote.
@@ -433,6 +466,32 @@ impl<S: Storage> Node<S> {
                 conflict_term,
                 &mut actions,
             )?,
+            Message::InstallSnapshot {
+                last_index,
+                last_term,
+                offset,
+                data,
+                done,
+                ..
+            } => self.handle_install_snapshot(
+                from,
+                SnapshotMeta {
+                    index: last_index,
+                    term: last_term,
+                },
+                offset,
+                data,
+                done,
+                &mut actions,
+            )?,
+            Message::InstallSnapshotReply {
+                term,
+                last_index,
+                next_offset,
+                done,
+            } => {
+                self.handle_snapshot_reply(from, term, last_index, next_offset, done, &mut actions)?
+            }
         }
         Ok(actions)
     }
@@ -613,6 +672,7 @@ impl<S: Storage> Node<S> {
         self.heartbeat_elapsed = 0;
         self.election_elapsed = 0;
         self.active.clear();
+        self.snapshot_progress.clear();
 
         let next = self.storage.last_index() + 1;
         self.next_index.clear();
@@ -707,6 +767,35 @@ impl<S: Storage> Node<S> {
         self.reset_election_timer();
 
         let term = self.term();
+
+        // Part of what this message covers may already be folded into a
+        // snapshot here. Everything up to the snapshot is committed, so it
+        // agrees with any current leader: skip that part of the message and
+        // carry on from the snapshot's end, rather than rejecting it and
+        // costing the leader a round trip to find that out.
+        let snapshot = self.storage.snapshot_meta();
+        let (prev_log_index, prev_log_term, entries) = if prev_log_index < snapshot.index {
+            let skip = (snapshot.index - prev_log_index) as usize;
+            if skip >= entries.len() {
+                actions.push(Action::Send {
+                    to: from,
+                    message: Message::AppendEntriesReply {
+                        term,
+                        success: true,
+                        match_index: snapshot.index,
+                        conflict_index: 0,
+                        conflict_term: None,
+                    },
+                });
+                return Ok(());
+            }
+            let mut entries = entries;
+            entries.drain(..skip);
+            (snapshot.index, snapshot.term, entries)
+        } else {
+            (prev_log_index, prev_log_term, entries)
+        };
+
         let local_term = self.storage.term_at(prev_log_index);
 
         if local_term != Some(prev_log_term) {
@@ -802,7 +891,7 @@ impl<S: Storage> Node<S> {
                 // batch per round trip. Only on real progress, so a stale
                 // or duplicate reply cannot start a second stream.
                 if match_index < self.storage.last_index() {
-                    actions.push(self.append_message_for(from));
+                    actions.push(self.append_message_for(from)?);
                 }
             }
             return Ok(());
@@ -822,7 +911,7 @@ impl<S: Storage> Node<S> {
             None => conflict_index,
         };
         self.next_index.insert(from, next.max(1));
-        actions.push(self.append_message_for(from));
+        actions.push(self.append_message_for(from)?);
         Ok(())
     }
 
@@ -849,32 +938,180 @@ impl<S: Storage> Node<S> {
     fn broadcast_append(&mut self, actions: &mut Vec<Action>) -> Result<()> {
         let peers = self.peers.clone();
         for peer in peers {
-            actions.push(self.append_message_for(peer));
+            actions.push(self.append_message_for(peer)?);
         }
         Ok(())
     }
 
-    fn append_message_for(&self, peer: NodeId) -> Action {
+    /// What to send `peer` next: entries if the leader still has the ones
+    /// it needs, or the next piece of the snapshot if it does not.
+    fn append_message_for(&self, peer: NodeId) -> Result<Action> {
         let next = self
             .next_index
             .get(&peer)
             .copied()
             .unwrap_or_else(|| self.storage.last_index() + 1);
-        let prev_log_index = next.saturating_sub(1);
-        Action::Send {
+        let snapshot = self.storage.snapshot_meta();
+
+        if next <= snapshot.index {
+            // The entries this follower needs are folded into the snapshot,
+            // and `prev_log_index` would name one this leader no longer has
+            // a term for. Send the state instead.
+            let offset = match self.snapshot_progress.get(&peer) {
+                Some(&(index, offset)) if index == snapshot.index => offset,
+                // A newer snapshot than the one it was receiving: start over.
+                _ => 0,
+            };
+            let data = self
+                .storage
+                .read_snapshot(offset, self.config.max_append_bytes.max(1))?;
+            let done = offset + data.len() as u64 >= self.storage.snapshot_len();
+            return Ok(Action::Send {
+                to: peer,
+                message: Message::InstallSnapshot {
+                    term: self.term(),
+                    last_index: snapshot.index,
+                    last_term: snapshot.term,
+                    offset,
+                    data,
+                    done,
+                },
+            });
+        }
+
+        let prev_log_index = next - 1;
+        Ok(Action::Send {
             to: peer,
             message: Message::AppendEntries {
                 term: self.term(),
                 prev_log_index,
-                // A `None` here means the leader has itself discarded that
-                // entry, which cannot happen without snapshots.
+                // Always known: `next` is past the snapshot, so the entry
+                // before it is either held or is the snapshot's own index.
                 prev_log_term: self.storage.term_at(prev_log_index).unwrap_or(0),
                 entries: self
                     .storage
                     .entries_within(next, self.config.max_append_bytes),
                 leader_commit: self.commit_index,
             },
+        })
+    }
+
+    // -- snapshots ------------------------------------------------------
+
+    fn handle_install_snapshot(
+        &mut self,
+        from: NodeId,
+        meta: SnapshotMeta,
+        offset: u64,
+        data: Vec<u8>,
+        done: bool,
+        actions: &mut Vec<Action>,
+    ) -> Result<()> {
+        // As with `AppendEntries`: the term was checked in `step`, so this
+        // is the current leader, and hearing from it is a heartbeat.
+        self.role = Role::Follower;
+        self.leader_id = Some(from);
+        self.reset_election_timer();
+
+        let term = self.term();
+        let reply = |next_offset: u64, done: bool| Action::Send {
+            to: from,
+            message: Message::InstallSnapshotReply {
+                term,
+                last_index: meta.index,
+                next_offset,
+                done,
+            },
+        };
+
+        // Everything it covers is already committed here, which means this
+        // node already holds it, in its log or in its own snapshot.
+        // Installing it would only move backwards.
+        if meta.index <= self.commit_index {
+            self.incoming = None;
+            actions.push(reply(0, true));
+            return Ok(());
         }
+
+        let continuing = matches!(
+            &self.incoming,
+            Some((sender, m, _)) if *sender == from && *m == meta
+        );
+        if !continuing {
+            if offset != 0 {
+                // A piece from the middle of a snapshot this node has no
+                // start for. Ask for the beginning.
+                actions.push(reply(0, false));
+                return Ok(());
+            }
+            self.incoming = Some((from, meta, Vec::new()));
+        }
+
+        let (_, _, buf) = self.incoming.as_mut().expect("just ensured");
+        let held = buf.len() as u64;
+        if offset != held {
+            // A gap, or a piece already seen. Either way, say where this
+            // node has got to and let the leader carry on from there.
+            actions.push(reply(held, false));
+            return Ok(());
+        }
+        buf.extend_from_slice(&data);
+        let held = buf.len() as u64;
+        if !done {
+            actions.push(reply(held, false));
+            return Ok(());
+        }
+
+        let (_, meta, data) = self.incoming.take().expect("just used");
+        self.storage.save_snapshot(meta, &data)?;
+        // The snapshot is applied state, so the state machine must pick it
+        // up rather than wait for entries that no longer exist.
+        self.commit_index = self.commit_index.max(meta.index);
+        self.last_applied = self.last_applied.max(meta.index);
+        actions.push(reply(held, true));
+        Ok(())
+    }
+
+    fn handle_snapshot_reply(
+        &mut self,
+        from: NodeId,
+        term: u64,
+        last_index: u64,
+        next_offset: u64,
+        done: bool,
+        actions: &mut Vec<Action>,
+    ) -> Result<()> {
+        if self.role != Role::Leader || term != self.term() {
+            return Ok(());
+        }
+        self.active.insert(from);
+        let current = self.storage.snapshot_meta().index;
+
+        if done {
+            self.snapshot_progress.remove(&from);
+            let matched = self.match_index.get(&from).copied().unwrap_or(0);
+            if last_index > matched {
+                self.match_index.insert(from, last_index);
+                self.next_index.insert(from, last_index + 1);
+                self.maybe_commit();
+            }
+            // Whatever follows the snapshot goes out as ordinary entries,
+            // or as a newer snapshot if this leader has compacted since.
+            if self.next_index.get(&from).copied().unwrap_or(0) <= self.storage.last_index() {
+                actions.push(self.append_message_for(from)?);
+            }
+            return Ok(());
+        }
+
+        let offset = if last_index == current {
+            next_offset
+        } else {
+            // About a snapshot since replaced. Start the current one.
+            0
+        };
+        self.snapshot_progress.insert(from, (current, offset));
+        actions.push(self.append_message_for(from)?);
+        Ok(())
     }
 
     fn append_local(&mut self, command: Command) -> Result<u64> {
@@ -921,6 +1158,12 @@ impl<S: Storage> Node<S> {
                 Message::RequestVote { .. } => Message::RequestVoteReply {
                     term,
                     granted: false,
+                },
+                Message::InstallSnapshot { last_index, .. } => Message::InstallSnapshotReply {
+                    term,
+                    last_index: *last_index,
+                    next_offset: 0,
+                    done: false,
                 },
                 _ => Message::AppendEntriesReply {
                     term,
@@ -1523,5 +1766,375 @@ mod tests {
             pre_granted(&node.step(3, pre_vote_request(6, 1, 5)).unwrap()),
             "a node held its loyalty past any evidence the leader was alive"
         );
+    }
+
+    // -- snapshots ------------------------------------------------------
+
+    fn snap(index: u64, term: u64) -> SnapshotMeta {
+        SnapshotMeta { index, term }
+    }
+
+    /// A follower whose log is `spec`, folded into a snapshot up to
+    /// `through`.
+    fn compacted_follower(
+        term: u64,
+        spec: &[(u64, u64)],
+        through: SnapshotMeta,
+    ) -> Node<MemStorage> {
+        let mut node = follower(term, spec);
+        node.storage.save_snapshot(through, b"state").unwrap();
+        node
+    }
+
+    fn install(term: u64, meta: SnapshotMeta, offset: u64, data: &[u8], done: bool) -> Message {
+        Message::InstallSnapshot {
+            term,
+            last_index: meta.index,
+            last_term: meta.term,
+            offset,
+            data: data.to_vec(),
+            done,
+        }
+    }
+
+    /// (next_offset, done) from the single reply a node sent.
+    fn snapshot_reply(actions: &[Action]) -> (u64, bool) {
+        match actions {
+            [Action::Send {
+                message:
+                    Message::InstallSnapshotReply {
+                        next_offset, done, ..
+                    },
+                ..
+            }] => (*next_offset, *done),
+            other => panic!("expected one snapshot reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_entries_that_start_inside_the_snapshot_are_accepted() {
+        let mut node = compacted_follower(1, &[(1, 1), (2, 1), (3, 1)], snap(3, 1));
+        // The leader thinks this follower needs everything from 2.
+        let message = append(1, (1, 1), &[(2, 1), (3, 1), (4, 1), (5, 1)], 0);
+        assert!(
+            accepted(&node.step(2, message).unwrap()),
+            "the overlap with the snapshot should be skipped, not refused"
+        );
+        assert_eq!(node.last_index(), 5);
+        assert_eq!(node.storage().first_index(), 4);
+    }
+
+    #[test]
+    fn append_entries_entirely_inside_the_snapshot_report_the_snapshot() {
+        let mut node = compacted_follower(1, &[(1, 1), (2, 1), (3, 1)], snap(3, 1));
+        let actions = node
+            .step(2, append(1, (0, 0), &[(1, 1), (2, 1)], 0))
+            .unwrap();
+        match actions.as_slice() {
+            [Action::Send {
+                message:
+                    Message::AppendEntriesReply {
+                        success,
+                        match_index,
+                        ..
+                    },
+                ..
+            }] => {
+                assert!(success);
+                assert_eq!(*match_index, 3, "everything to the snapshot is held");
+            }
+            other => panic!("expected a success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_arriving_in_pieces_is_installed_whole() {
+        let mut node = follower(2, &[]);
+        let meta = snap(40, 2);
+
+        assert_eq!(
+            snapshot_reply(&node.step(9, install(2, meta, 0, b"abc", false)).unwrap()),
+            (3, false)
+        );
+        assert_eq!(
+            snapshot_reply(&node.step(9, install(2, meta, 3, b"def", false)).unwrap()),
+            (6, false)
+        );
+        assert_eq!(
+            node.storage().snapshot_meta(),
+            SnapshotMeta::default(),
+            "not until the last piece"
+        );
+        assert_eq!(
+            snapshot_reply(&node.step(9, install(2, meta, 6, b"g", true)).unwrap()),
+            (7, true)
+        );
+
+        assert_eq!(node.storage().snapshot_meta(), meta);
+        assert_eq!(node.storage().read_snapshot(0, 100).unwrap(), b"abcdefg");
+        assert_eq!(node.commit_index(), 40, "a snapshot is committed state");
+        assert!(
+            node.take_committed().is_empty(),
+            "and there are no entries to apply"
+        );
+        assert_eq!(node.last_index(), 40);
+    }
+
+    #[test]
+    fn a_missed_piece_is_asked_for_again() {
+        let mut node = follower(2, &[]);
+        let meta = snap(40, 2);
+        node.step(9, install(2, meta, 0, b"abc", false)).unwrap();
+        // The piece at 3 went missing; the one at 6 arrives.
+        assert_eq!(
+            snapshot_reply(&node.step(9, install(2, meta, 6, b"ghi", false)).unwrap()),
+            (3, false),
+            "the follower should say where it actually is"
+        );
+        node.step(9, install(2, meta, 3, b"def", true)).unwrap();
+        assert_eq!(node.storage().read_snapshot(0, 100).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn a_repeated_piece_is_not_appended_twice() {
+        let mut node = follower(2, &[]);
+        let meta = snap(40, 2);
+        node.step(9, install(2, meta, 0, b"abc", false)).unwrap();
+        assert_eq!(
+            snapshot_reply(&node.step(9, install(2, meta, 0, b"abc", false)).unwrap()),
+            (3, false)
+        );
+        node.step(9, install(2, meta, 3, b"d", true)).unwrap();
+        assert_eq!(node.storage().read_snapshot(0, 100).unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn pieces_from_two_leaders_are_never_spliced() {
+        let mut node = follower(2, &[]);
+        let meta = snap(40, 2);
+        node.step(8, install(2, meta, 0, b"from-8:", false))
+            .unwrap();
+        // A different leader, the same snapshot, but it starts from its own
+        // beginning. Continuing node 8's buffer with node 9's bytes would
+        // produce a snapshot neither of them sent.
+        assert_eq!(
+            snapshot_reply(&node.step(9, install(3, meta, 7, b"tail", true)).unwrap()),
+            (0, false),
+            "a mid-snapshot piece from someone new must restart the transfer"
+        );
+        node.step(9, install(3, meta, 0, b"from-9", true)).unwrap();
+        assert_eq!(node.storage().read_snapshot(0, 100).unwrap(), b"from-9");
+    }
+
+    #[test]
+    fn a_snapshot_behind_what_is_committed_is_not_installed() {
+        let mut node = follower(2, &[(1, 1), (2, 1), (3, 2)]);
+        node.step(9, append(2, (3, 2), &[], 3)).unwrap();
+        assert_eq!(node.commit_index(), 3);
+
+        assert_eq!(
+            snapshot_reply(
+                &node
+                    .step(9, install(2, snap(2, 1), 0, b"old", true))
+                    .unwrap()
+            ),
+            (0, true),
+            "it already has all of that"
+        );
+        assert_eq!(node.storage().snapshot_meta(), SnapshotMeta::default());
+        assert_eq!(node.last_index(), 3, "and nothing was thrown away");
+    }
+
+    #[test]
+    fn installing_over_a_log_that_agrees_keeps_its_tail() {
+        let mut node = follower(2, &[(1, 1), (2, 1), (3, 2), (4, 2)]);
+        node.step(9, install(2, snap(3, 2), 0, b"s", true)).unwrap();
+        assert_eq!(
+            node.last_index(),
+            4,
+            "entry 4 agrees with the snapshot, so it stays"
+        );
+    }
+
+    #[test]
+    fn installing_over_a_log_that_disagrees_discards_it() {
+        let mut node = follower(3, &[(1, 1), (2, 1), (3, 1), (4, 1)]);
+        node.step(9, install(3, snap(3, 3), 0, b"s", true)).unwrap();
+        assert_eq!(node.last_index(), 3);
+        assert_eq!(node.storage().entry(4), None);
+    }
+
+    #[test]
+    fn a_restart_starts_from_the_snapshot() {
+        let node = compacted_follower(2, &[(1, 1), (2, 1), (3, 2)], snap(3, 2));
+        let storage = node.into_storage();
+        let mut node = Node::new(1, vec![1, 2, 3], Config::default(), storage);
+        assert_eq!(node.commit_index(), 3);
+        assert!(
+            node.take_committed().is_empty(),
+            "nothing folded away is handed out again"
+        );
+    }
+
+    #[test]
+    fn only_applied_state_can_be_compacted() {
+        let mut node = follower(1, &[(1, 1), (2, 1), (3, 1)]);
+        node.step(9, append(1, (3, 1), &[], 3)).unwrap();
+        assert!(
+            !node.compact(3, b"x").unwrap(),
+            "committed but not handed out yet"
+        );
+        assert_eq!(node.take_committed().len(), 3);
+        assert!(node.compact(2, b"x").unwrap());
+        assert!(
+            !node.compact(2, b"x").unwrap(),
+            "no newer than what is there"
+        );
+        assert_eq!(node.storage().first_index(), 3);
+    }
+
+    /// The leader's half: a follower that needs what the leader has folded
+    /// away is sent the snapshot a budget's worth at a time, and resumes
+    /// with ordinary entries once it has it.
+    #[test]
+    fn a_leader_sends_a_snapshot_in_pieces_then_carries_on_with_entries() {
+        let config = Config {
+            max_append_bytes: 100,
+            ..Config::default()
+        };
+        let mut storage = MemStorage::new();
+        storage
+            .save_hard_state(HardState {
+                term: 2,
+                voted_for: Some(1),
+            })
+            .unwrap();
+        let log: Vec<Entry> = (1..=12)
+            .map(|index| Entry {
+                term: 2,
+                index,
+                command: Command::Noop,
+            })
+            .collect();
+        storage.append(&log).unwrap();
+        storage.save_snapshot(snap(10, 2), &[7u8; 250]).unwrap();
+        let mut node = Node::new(1, vec![1, 2, 3], config, storage);
+        node.last_applied = 12;
+        node.leader_with(&[(2, 0), (3, 12)]);
+
+        let mut offset = 0;
+        let mut pieces = 0;
+        let mut action = node.append_message_for(2).unwrap();
+        loop {
+            let Action::Send {
+                message:
+                    Message::InstallSnapshot {
+                        offset: sent_at,
+                        data,
+                        done,
+                        last_index,
+                        ..
+                    },
+                ..
+            } = action
+            else {
+                panic!("expected a snapshot piece, got {action:?}");
+            };
+            assert_eq!(sent_at, offset);
+            assert!(data.len() <= 100, "a piece went over the budget");
+            assert_eq!(last_index, 10);
+            pieces += 1;
+            offset += data.len() as u64;
+
+            let reply = Message::InstallSnapshotReply {
+                term: 2,
+                last_index: 10,
+                next_offset: offset,
+                done,
+            };
+            let actions = node.step(2, reply).unwrap();
+            if done {
+                // Past the snapshot, the rest is ordinary log.
+                match actions.as_slice() {
+                    [Action::Send {
+                        message:
+                            Message::AppendEntries {
+                                prev_log_index,
+                                entries,
+                                ..
+                            },
+                        ..
+                    }] => {
+                        assert_eq!(*prev_log_index, 10);
+                        assert_eq!(
+                            entries.iter().map(|e| e.index).collect::<Vec<_>>(),
+                            vec![11, 12]
+                        );
+                    }
+                    other => panic!("expected entries after the snapshot, got {other:?}"),
+                }
+                break;
+            }
+            action = actions.into_iter().next().expect("the next piece");
+        }
+        assert_eq!(pieces, 3, "250 bytes at 100 a piece");
+        assert_eq!(node.match_index.get(&2), Some(&10));
+    }
+
+    /// A reply about a snapshot the leader has since replaced starts the
+    /// new one from the beginning, rather than continuing it from an
+    /// offset that belonged to different bytes.
+    #[test]
+    fn a_reply_about_an_older_snapshot_restarts_the_transfer() {
+        let config = Config {
+            max_append_bytes: 100,
+            ..Config::default()
+        };
+        let mut storage = MemStorage::new();
+        storage
+            .save_hard_state(HardState {
+                term: 2,
+                voted_for: Some(1),
+            })
+            .unwrap();
+        let log: Vec<Entry> = (1..=20)
+            .map(|index| Entry {
+                term: 2,
+                index,
+                command: Command::Noop,
+            })
+            .collect();
+        storage.append(&log).unwrap();
+        storage.save_snapshot(snap(20, 2), &[1u8; 300]).unwrap();
+        let mut node = Node::new(1, vec![1, 2, 3], config, storage);
+        node.leader_with(&[(2, 0), (3, 20)]);
+
+        let actions = node
+            .step(
+                2,
+                Message::InstallSnapshotReply {
+                    term: 2,
+                    last_index: 10,
+                    next_offset: 200,
+                    done: false,
+                },
+            )
+            .unwrap();
+        match actions.as_slice() {
+            [Action::Send {
+                message:
+                    Message::InstallSnapshot {
+                        offset, last_index, ..
+                    },
+                ..
+            }] => {
+                assert_eq!(*last_index, 20);
+                assert_eq!(
+                    *offset, 0,
+                    "an offset into the old snapshot means nothing in the new one"
+                );
+            }
+            other => panic!("expected the new snapshot from the start, got {other:?}"),
+        }
     }
 }

@@ -15,13 +15,26 @@
 //!
 //! The node never inspects a command, so the consensus layer stays a
 //! consensus layer; encoding and applying live here.
+//!
+//! So does the snapshot. Every so often the store's contents, as of the
+//! last applied index, are written out and handed to the node, which
+//! discards the log they cover. A snapshot is a sequence of the store's own
+//! records, one per live key, so it is checksummed per record the same way
+//! everything else is. A follower too far behind for the leader to send it
+//! entries is sent the snapshot instead, and its store is replaced by it.
 
 use crate::crc::crc32_parts;
 use crate::error::{Error, Result};
 use crate::raft::{Accepted, Action, Command, Message, Node, NodeId, ProposeError, Role, Storage};
 use crate::record::{self, Header, HEADER_LEN};
 use crate::store::Store;
+use std::collections::HashMap;
 use std::path::Path;
+
+/// Applied entries between snapshots, by default. Small enough that a log
+/// never grows far, large enough that the cost of writing out the whole
+/// store is spread over plenty of writes.
+pub const DEFAULT_SNAPSHOT_EVERY: u64 = 10_000;
 
 /// Where a store records the last log index whose effect it holds. It sits
 /// beside the data files, which the store ignores because it does not end
@@ -97,6 +110,7 @@ pub struct ReplicatedStore<S: Storage> {
     node: Node<S>,
     store: Store,
     applied: u64,
+    snapshot_every: u64,
 }
 
 impl<S: Storage> ReplicatedStore<S> {
@@ -105,13 +119,35 @@ impl<S: Storage> ReplicatedStore<S> {
     /// The store remembers how far through the log it has applied, so a
     /// restart resumes from there rather than writing every committed
     /// entry into the store a second time.
-    pub fn new(node: Node<S>, store: Store) -> ReplicatedStore<S> {
+    ///
+    /// If the node holds a snapshot newer than that, the store is brought
+    /// up to it here, before anything can read from it. That happens when
+    /// a crash came after a snapshot was installed from a leader but before
+    /// the store caught up with it, which includes a crash in the middle of
+    /// catching up.
+    pub fn new(node: Node<S>, store: Store) -> Result<ReplicatedStore<S>> {
         let applied = read_applied(store.dir());
-        ReplicatedStore {
+        let mut replica = ReplicatedStore {
             node,
             store,
             applied,
+            snapshot_every: DEFAULT_SNAPSHOT_EVERY,
+        };
+        if replica.snapshot_index() > replica.applied {
+            replica.restore()?;
         }
+        Ok(replica)
+    }
+
+    /// How many applied entries to let accumulate before folding them into
+    /// a snapshot. Zero turns snapshots off, and the log grows for ever.
+    pub fn set_snapshot_every(&mut self, entries: u64) {
+        self.snapshot_every = entries;
+    }
+
+    /// The last index covered by the node's current snapshot, or 0.
+    pub fn snapshot_index(&self) -> u64 {
+        self.node.storage().snapshot_meta().index
     }
 
     pub fn node(&self) -> &Node<S> {
@@ -218,6 +254,14 @@ impl<S: Storage> ReplicatedStore<S> {
     /// Applying the rest of the log around it would leave this node's state
     /// quietly different from everyone else's, so it stops instead.
     fn apply(&mut self) -> Result<()> {
+        // A snapshot ahead of the store, which means one arrived from a
+        // leader. The entries it covers are gone from this node's log, so
+        // there is nothing to apply them from: the store has to become the
+        // snapshot before anything after it can be applied.
+        if self.snapshot_index() > self.applied {
+            self.restore()?;
+        }
+
         let before = self.applied;
         for entry in self.node.take_committed() {
             // A node relearns its commit index from zero after a restart,
@@ -248,8 +292,137 @@ impl<S: Storage> ReplicatedStore<S> {
             self.store.sync()?;
             write_applied(self.store.dir(), self.applied)?;
         }
+
+        self.maybe_snapshot()
+    }
+
+    /// Fold the applied log into a snapshot once enough of it has built up.
+    ///
+    /// The store has already been synced up to `applied` by the time this
+    /// runs, which matters: once the log is discarded, the snapshot and the
+    /// store are the only record of it.
+    fn maybe_snapshot(&mut self) -> Result<()> {
+        if self.snapshot_every == 0 {
+            return Ok(());
+        }
+        if self.applied < self.snapshot_index() + self.snapshot_every {
+            return Ok(());
+        }
+        let data = encode_snapshot(&self.store)?;
+        if self.node.compact(self.applied, &data)? {
+            // The store grows by an append for every write, and in a
+            // cluster nothing else ever compacts it. The moment the log is
+            // compacted is the natural moment to compact the store too.
+            if self.store.stats().fragmentation() > 0.5 {
+                self.store.compact()?;
+            }
+        }
         Ok(())
     }
+
+    /// Make the store exactly the node's snapshot.
+    ///
+    /// Exactly, not merely including it. A key this node still holds but
+    /// the cluster deleted during the entries it missed is not in the
+    /// snapshot, and writing the snapshot over the store would leave it
+    /// there. So everything the snapshot does not have is deleted first.
+    ///
+    /// Interruptible at any point: the applied index is only moved once
+    /// the store is synced, so a crash part way through leaves the snapshot
+    /// still ahead of the store, and the next start runs this again. Values
+    /// already right are left alone, so running it twice does not grow the
+    /// store twice.
+    fn restore(&mut self) -> Result<()> {
+        let index = self.snapshot_index();
+        let len = self.node.storage().snapshot_len();
+        let Ok(len) = usize::try_from(len) else {
+            return Err(Error::Corrupt {
+                file_id: 0,
+                offset: 0,
+                detail: "snapshot is larger than this machine can address",
+            });
+        };
+        let data = self.node.storage().read_snapshot(0, len)?;
+        let wanted = decode_snapshot(&data)?;
+
+        let stale: Vec<Vec<u8>> = self
+            .store
+            .keys()
+            .filter(|key| !wanted.contains_key(*key))
+            .map(<[u8]>::to_vec)
+            .collect();
+        for key in stale {
+            self.store.delete(&key)?;
+        }
+        for (key, value) in &wanted {
+            if self.store.get(key)?.as_deref() != Some(value.as_slice()) {
+                self.store.put(key, value)?;
+            }
+        }
+
+        self.store.sync()?;
+        self.applied = index;
+        write_applied(self.store.dir(), index)
+    }
+}
+
+/// The store's live contents as a snapshot: one record per key, in key
+/// order, so that two identical stores produce identical snapshots.
+///
+/// Built in memory, which is the price of simplicity here: taking or
+/// restoring a snapshot needs room for the store's whole contents at once.
+fn encode_snapshot(store: &Store) -> Result<Vec<u8>> {
+    let mut keys: Vec<&[u8]> = store.keys().collect();
+    keys.sort_unstable();
+    let mut out = Vec::new();
+    for key in keys {
+        let value = store.get(key)?.ok_or(Error::Corrupt {
+            file_id: 0,
+            offset: 0,
+            detail: "a key vanished while the snapshot was being taken",
+        })?;
+        // A timestamp of zero, so the bytes depend on the contents alone.
+        out.extend_from_slice(&record::encode(key, Some(&value), 0)?);
+    }
+    Ok(out)
+}
+
+fn decode_snapshot(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
+    let corrupt = |offset: usize, detail| Error::Corrupt {
+        file_id: 0,
+        offset: offset as u64,
+        detail,
+    };
+    let mut out = HashMap::new();
+    let mut at = 0usize;
+    while at < data.len() {
+        if data.len() - at < HEADER_LEN {
+            return Err(corrupt(at, "snapshot ends inside a record header"));
+        }
+        let header = Header::decode(
+            data[at..at + HEADER_LEN]
+                .try_into()
+                .expect("checked length"),
+        );
+        let Ok(len) = usize::try_from(header.record_len()) else {
+            return Err(corrupt(at, "snapshot record is too large"));
+        };
+        if len > data.len() - at {
+            return Err(corrupt(at, "snapshot ends inside a record"));
+        }
+        let key_end = at + HEADER_LEN + header.key_len as usize;
+        let key = &data[at + HEADER_LEN..key_end];
+        let value = &data[key_end..at + len];
+        if !header.verify(key, value) {
+            return Err(corrupt(at, "checksum mismatch in a snapshot record"));
+        }
+        if header.is_tombstone() {
+            return Err(corrupt(at, "a snapshot holds live keys, never deletions"));
+        }
+        out.insert(key.to_vec(), value.to_vec());
+        at += len;
+    }
+    Ok(out)
 }
 
 /// The applied index, or 0 if there is none to be had.
@@ -283,6 +456,140 @@ fn write_applied(dir: &Path, index: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_store(label: &str) -> (std::path::PathBuf, Store) {
+        let path = std::env::temp_dir().join(format!(
+            "minicask-snapshot-{label}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let store = Store::open(&path).unwrap();
+        (path, store)
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_the_live_keys_only() {
+        let (path, mut store) = temp_store("round-trip");
+        store.put(b"a", b"1").unwrap();
+        store.put(b"b", b"").unwrap();
+        store.put(b"gone", b"x").unwrap();
+        store.delete(b"gone").unwrap();
+        store.put(b"a", b"overwritten").unwrap();
+
+        let decoded = decode_snapshot(&encode_snapshot(&store).unwrap()).unwrap();
+        let mut pairs: Vec<_> = decoded.into_iter().collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (b"a".to_vec(), b"overwritten".to_vec()),
+                (b"b".to_vec(), Vec::new()),
+            ]
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn identical_stores_make_identical_snapshots() {
+        let (p1, mut one) = temp_store("same-1");
+        let (p2, mut two) = temp_store("same-2");
+        for (k, v) in [("z", "1"), ("a", "2"), ("m", "3")] {
+            one.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        for (k, v) in [("m", "3"), ("z", "1"), ("a", "2")] {
+            two.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        assert_eq!(
+            encode_snapshot(&one).unwrap(),
+            encode_snapshot(&two).unwrap()
+        );
+        drop((one, two));
+        let _ = std::fs::remove_dir_all(&p1);
+        let _ = std::fs::remove_dir_all(&p2);
+    }
+
+    #[test]
+    fn a_damaged_snapshot_is_refused() {
+        let (path, mut store) = temp_store("damaged");
+        store.put(b"key", b"value").unwrap();
+        let mut data = encode_snapshot(&store).unwrap();
+        let last = data.len() - 1;
+        data[last] ^= 0b0000_0100;
+        assert!(matches!(decode_snapshot(&data), Err(Error::Corrupt { .. })));
+        assert!(matches!(
+            decode_snapshot(&data[..data.len() - 2]),
+            Err(Error::Corrupt { .. })
+        ));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A node whose storage holds `snapshot`, joined to `store`, which
+    /// makes `new` restore the store to it.
+    fn restored(store: Store, snapshot: &[u8]) -> ReplicatedStore<crate::raft::MemStorage> {
+        use crate::raft::{Config, MemStorage, SnapshotMeta, Storage};
+        let mut storage = MemStorage::new();
+        storage
+            .save_snapshot(SnapshotMeta { index: 5, term: 1 }, snapshot)
+            .unwrap();
+        let node = Node::new(1, vec![1], Config::default(), storage);
+        ReplicatedStore::new(node, store).unwrap()
+    }
+
+    #[test]
+    fn a_restore_makes_the_store_exactly_the_snapshot() {
+        let (path, mut store) = temp_store("restore-exact");
+        store.put(b"same", b"1").unwrap();
+        store.put(b"changed", b"old").unwrap();
+        store.put(b"extra", b"not in the snapshot").unwrap();
+
+        let (path2, mut source) = temp_store("restore-source");
+        source.put(b"same", b"1").unwrap();
+        source.put(b"changed", b"new").unwrap();
+        source.put(b"missing", b"only in the snapshot").unwrap();
+        let snapshot = encode_snapshot(&source).unwrap();
+
+        let replica = restored(store, &snapshot);
+        assert_eq!(replica.applied_index(), 5);
+        assert_eq!(replica.get(b"extra").unwrap(), None);
+        assert_eq!(replica.get(b"changed").unwrap(), Some(b"new".to_vec()));
+        assert_eq!(
+            replica.get(b"missing").unwrap(),
+            Some(b"only in the snapshot".to_vec())
+        );
+        assert_eq!(replica.len(), 3);
+        drop((replica, source));
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_dir_all(&path2);
+    }
+
+    /// A restore that is interrupted runs again on the next start, and a
+    /// node stuck crashing mid-restore runs it again and again. Each run
+    /// must only write what actually differs, or every attempt grows the
+    /// store by its whole size.
+    #[test]
+    fn restoring_onto_a_store_that_already_matches_writes_nothing() {
+        let (path, mut store) = temp_store("restore-idempotent");
+        for i in 0..20u8 {
+            store.put(&[b'k', i], &[b'v'; 64]).unwrap();
+        }
+        let snapshot = encode_snapshot(&store).unwrap();
+        let before = store.stats().disk_bytes;
+
+        let replica = restored(store, &snapshot);
+        assert_eq!(
+            replica.store().stats().disk_bytes,
+            before,
+            "restoring identical contents rewrote them"
+        );
+        drop(replica);
+        let _ = std::fs::remove_dir_all(&path);
+    }
 
     #[test]
     fn a_put_round_trips() {

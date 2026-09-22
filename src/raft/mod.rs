@@ -35,7 +35,7 @@ mod node;
 mod storage;
 pub mod wire;
 
-pub use log::{Command, Entry, HardState, MemStorage, NodeId, Storage, StorageExt};
+pub use log::{Command, Entry, HardState, MemStorage, NodeId, SnapshotMeta, Storage, StorageExt};
 pub use message::{Action, Message};
 pub use node::{Accepted, Config, Node, ProposeError, Role};
 pub use storage::DiskStorage;
