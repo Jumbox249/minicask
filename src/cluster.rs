@@ -75,7 +75,11 @@ struct Shared {
     /// Woken whenever the applied index or the role changes, so a client
     /// waiting on a write does not have to poll.
     progress: Condvar,
-    senders: HashMap<NodeId, Sender<Message>>,
+    /// One queue per peer. The mutex is not for contention, which there
+    /// is none of: a `Sender` is `Send` but was not `Sync` until Rust
+    /// 1.72, and this crate builds on 1.70. Wrapping each one separately
+    /// rather than the map keeps dispatch to one peer off another's path.
+    senders: HashMap<NodeId, Mutex<Sender<Message>>>,
     client_addrs: HashMap<NodeId, String>,
 }
 
@@ -92,6 +96,7 @@ impl Shared {
             if let Some(sender) = self.senders.get(&to) {
                 // A full or dead queue is not an error worth reporting:
                 // Raft resends on the next heartbeat.
+                let sender = sender.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = sender.send(message);
             }
         }
@@ -148,7 +153,7 @@ impl ClusterNode {
         let mut client_addrs = HashMap::new();
         for peer in &config.peers {
             let (tx, rx) = mpsc::channel();
-            senders.insert(peer.id, tx);
+            senders.insert(peer.id, Mutex::new(tx));
             client_addrs.insert(peer.id, peer.client_addr.clone());
             let addr = peer.raft_addr.clone();
             let id = config.id;
