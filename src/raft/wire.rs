@@ -20,7 +20,7 @@ use std::io::{self, Read, Write};
 const MAGIC: u32 = 0x4d_43_52_46; // "MCRF"
 const PREFIX_LEN: usize = 20;
 /// A frame beyond this is garbage or a hostile peer, not a message.
-const MAX_FRAME: u32 = 64 * 1024 * 1024;
+pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
 /// Tags for the four message types.
 const REQUEST_VOTE: u8 = 1;

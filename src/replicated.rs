@@ -16,10 +16,18 @@
 //! The node never inspects a command, so the consensus layer stays a
 //! consensus layer; encoding and applying live here.
 
+use crate::crc::crc32_parts;
 use crate::error::{Error, Result};
 use crate::raft::{Accepted, Action, Command, Message, Node, NodeId, ProposeError, Role, Storage};
 use crate::record::{self, Header, HEADER_LEN};
 use crate::store::Store;
+use std::path::Path;
+
+/// Where a store records the last log index whose effect it holds. It sits
+/// beside the data files, which the store ignores because it does not end
+/// in `.log`, so that removing the data removes it too: an index that
+/// outlived its data would skip writes the store no longer has.
+const APPLIED_FILE: &str = "applied-index";
 
 /// A write, in the form that travels through the log.
 ///
@@ -94,14 +102,15 @@ pub struct ReplicatedStore<S: Storage> {
 impl<S: Storage> ReplicatedStore<S> {
     /// Join a consensus node to a store.
     ///
-    /// The store may already hold the effects of entries in the log; a
-    /// restart replays them, which is safe because applying the same
-    /// ordered writes twice lands in the same place.
+    /// The store remembers how far through the log it has applied, so a
+    /// restart resumes from there rather than writing every committed
+    /// entry into the store a second time.
     pub fn new(node: Node<S>, store: Store) -> ReplicatedStore<S> {
+        let applied = read_applied(store.dir());
         ReplicatedStore {
             node,
             store,
-            applied: 0,
+            applied,
         }
     }
 
@@ -209,7 +218,15 @@ impl<S: Storage> ReplicatedStore<S> {
     /// Applying the rest of the log around it would leave this node's state
     /// quietly different from everyone else's, so it stops instead.
     fn apply(&mut self) -> Result<()> {
+        let before = self.applied;
         for entry in self.node.take_committed() {
+            // A node relearns its commit index from zero after a restart,
+            // so everything up to what the store already holds comes past
+            // again. Applying it twice would give the same state, but each
+            // pass appends the whole history to the store's files again.
+            if entry.index <= self.applied {
+                continue;
+            }
             match &entry.command {
                 Command::Noop => {}
                 Command::Data(bytes) => match Op::decode(bytes)? {
@@ -221,8 +238,46 @@ impl<S: Storage> ReplicatedStore<S> {
             }
             self.applied = entry.index;
         }
+
+        if self.applied > before {
+            // The writes first, the claim second. If the index reached disk
+            // ahead of the data it describes, a crash in between would leave
+            // it pointing past writes the store lost, and they would be
+            // skipped for good. This matters when the store trades fsyncs
+            // for speed; with every write synced it costs one cheap call.
+            self.store.sync()?;
+            write_applied(self.store.dir(), self.applied)?;
+        }
         Ok(())
     }
+}
+
+/// The applied index, or 0 if there is none to be had.
+///
+/// Every failure falls back to 0, and that is always safe: it means
+/// replaying every committed write in order onto a store that already has
+/// some of them, which lands in the same state. The file only ever saves
+/// work, so there is nothing to be gained by refusing to start over it.
+fn read_applied(dir: &Path) -> u64 {
+    let Ok(bytes) = std::fs::read(dir.join(APPLIED_FILE)) else {
+        return 0;
+    };
+    let Ok(bytes) = <[u8; 12]>::try_from(bytes.as_slice()) else {
+        return 0;
+    };
+    let crc = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
+    if crc32_parts(&[&bytes[4..]]) != crc {
+        return 0;
+    }
+    u64::from_le_bytes(bytes[4..12].try_into().expect("eight bytes"))
+}
+
+fn write_applied(dir: &Path, index: u64) -> Result<()> {
+    let body = index.to_le_bytes();
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&crc32_parts(&[&body]).to_le_bytes());
+    buf[4..].copy_from_slice(&body);
+    crate::log::write_atomically(dir, APPLIED_FILE, &buf)
 }
 
 #[cfg(test)]

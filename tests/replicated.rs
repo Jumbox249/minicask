@@ -657,3 +657,145 @@ fn readiness_never_runs_ahead_of_the_data() {
         c.run_until("the cluster to settle", |c| c.leader().is_some());
     }
 }
+
+// -- restarts do not rewrite history ------------------------------------
+
+impl Cluster {
+    fn store_bytes(&self, id: NodeId) -> u64 {
+        self.node(id).store().stats().disk_bytes
+    }
+
+    fn store_dir(&self, id: NodeId) -> PathBuf {
+        self.dirs[&id].1.clone()
+    }
+}
+
+/// The bug this guards against: a restarted node relearns its commit index
+/// from zero, gets every committed entry handed to it again, and appends
+/// the whole history to its store a second time. The data comes out right,
+/// because the writes are idempotent, but the disk grows by the full size
+/// of the log on every restart.
+#[test]
+fn a_restart_does_not_rewrite_the_store() {
+    let mut c = Cluster::new(3);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    for i in 0..20u8 {
+        c.put(leader, &[b'k', i], &[b'v'; 64]);
+    }
+    c.settle();
+
+    let follower = (1..=3).find(|&id| id != leader).unwrap();
+    let before = c.store_bytes(follower);
+    let contents = c.contents(follower);
+
+    for _ in 0..3 {
+        c.restart(follower);
+        // Long enough for the leader to tell it the commit index again,
+        // which is the moment the old code replayed everything.
+        c.tick_n(40);
+        c.settle();
+    }
+
+    assert_eq!(
+        c.store_bytes(follower),
+        before,
+        "restarting grew the store, so committed entries were applied again"
+    );
+    assert_eq!(c.contents(follower), contents);
+    c.assert_all_agree();
+}
+
+/// And for the whole cluster at once, where every node relearns the commit
+/// index from whichever of them wins the next election.
+#[test]
+fn bouncing_the_cluster_does_not_rewrite_any_store() {
+    let mut c = Cluster::new(3);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    for i in 0..10u8 {
+        c.put(leader, &[b'k', i], &[b'v'; 64]);
+    }
+    c.settle();
+    let before: Vec<u64> = (1..=3).map(|id| c.store_bytes(id)).collect();
+
+    for _ in 0..2 {
+        for id in 1..=3 {
+            c.restart(id);
+        }
+        c.run_until("a leader after the bounce", |c| c.leader().is_some());
+        c.settle();
+    }
+
+    // Each new term adds a no-op to the log, but a no-op writes nothing to
+    // the store, so the stores must not have moved.
+    let after: Vec<u64> = (1..=3).map(|id| c.store_bytes(id)).collect();
+    assert_eq!(after, before, "a full bounce rewrote the stores");
+    c.assert_all_agree();
+}
+
+#[test]
+fn the_applied_index_survives_a_restart() {
+    let mut c = Cluster::new(3);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    c.put(leader, b"a", b"1");
+    c.put(leader, b"b", b"2");
+    c.settle();
+
+    let follower = (1..=3).find(|&id| id != leader).unwrap();
+    let applied = c.node(follower).applied_index();
+    assert!(applied > 0);
+
+    c.restart(follower);
+    assert_eq!(
+        c.node(follower).applied_index(),
+        applied,
+        "the store forgot how far through the log it had got"
+    );
+}
+
+/// The index only saves work, so losing it, or finding it damaged, must
+/// cost a replay and nothing else.
+#[test]
+fn a_missing_or_damaged_applied_index_only_costs_a_replay() {
+    for damage in ["missing", "garbage", "flipped bit"] {
+        let mut c = Cluster::new(3);
+        c.run_until("a leader", |c| c.leader().is_some());
+        let leader = c.leader().expect("a leader");
+        for i in 0..5u8 {
+            c.put(leader, &[b'k', i], &[b'v', i]);
+        }
+        c.delete(leader, &[b'k', 2]);
+        c.settle();
+
+        let follower = (1..=3).find(|&id| id != leader).unwrap();
+        let expected = c.contents(follower);
+        let file = c.store_dir(follower).join("applied-index");
+
+        c.kill(follower);
+        match damage {
+            "missing" => std::fs::remove_file(&file).expect("remove the index"),
+            "garbage" => std::fs::write(&file, b"not an index").expect("write junk"),
+            _ => {
+                let mut bytes = std::fs::read(&file).expect("read the index");
+                bytes[6] ^= 0b0001_0000;
+                std::fs::write(&file, &bytes).expect("write it back");
+            }
+        }
+        c.restart(follower);
+        assert_eq!(
+            c.node(follower).applied_index(),
+            0,
+            "{damage}: an index that cannot be trusted must not be used"
+        );
+
+        c.settle();
+        assert_eq!(
+            c.contents(follower),
+            expected,
+            "{damage}: the replay did not reproduce the store"
+        );
+        c.assert_all_agree();
+    }
+}

@@ -22,6 +22,33 @@ pub fn data_file_path(dir: &Path, file_id: u64) -> PathBuf {
     dir.join(format!("{file_id:010}.log"))
 }
 
+/// Replace `dir/name` with `bytes` so that a crash leaves either the old
+/// contents or the new ones and never a blend: written beside the target,
+/// fsynced, then renamed over it.
+pub fn write_atomically(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(name))?;
+    sync_dir(dir)
+}
+
+/// A rename is only durable once the directory holding it is. Windows has
+/// no equivalent call and does not need one.
+#[cfg(unix)]
+pub fn sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Every data file in the directory, oldest first.
 pub fn list_data_files(dir: &Path) -> Result<Vec<u64>> {
     let mut ids = Vec::new();

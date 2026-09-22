@@ -104,17 +104,7 @@ impl Storage for DiskStorage {
         buf[0..4].copy_from_slice(&crc32_parts(&[&body]).to_le_bytes());
         buf[4..].copy_from_slice(&body);
 
-        // Written to one side and renamed over the other, so a crash
-        // leaves either the old state or the new one and never a blend.
-        let tmp = self.dir.join("hard-state.tmp");
-        let final_path = self.dir.join("hard-state");
-        {
-            let mut file = File::create(&tmp)?;
-            file.write_all(&buf)?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&tmp, &final_path)?;
-        sync_dir(&self.dir)?;
+        crate::log::write_atomically(&self.dir, "hard-state", &buf)?;
 
         self.hard_state = state;
         Ok(())
@@ -345,19 +335,6 @@ fn read_hard_state(path: &Path) -> Result<HardState> {
         term,
         voted_for: (voted != NO_VOTE).then_some(voted),
     })
-}
-
-/// A rename is only durable once the directory holding it is. Windows has
-/// no equivalent call and does not need one.
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

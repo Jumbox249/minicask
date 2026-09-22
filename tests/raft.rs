@@ -1187,3 +1187,122 @@ fn a_stale_node_is_refused_at_the_pre_vote() {
         "a refused pre-vote must leave the term where it was"
     );
 }
+
+// -- message size -------------------------------------------------------
+
+/// A config whose budget fits about two of the test's entries, and whose
+/// heartbeat is slow enough that waiting for it would be obvious.
+fn small_batches() -> Config {
+    Config {
+        heartbeat_ticks: 8,
+        election_timeout_min: 30,
+        election_timeout_max: 40,
+        max_append_bytes: 200,
+        max_entry_bytes: 4096,
+    }
+}
+
+/// Every `AppendEntries` in flight either fits the budget or is a single
+/// entry, which is the only case allowed to exceed it.
+fn assert_messages_within(c: &Cluster, budget: usize) {
+    for m in &c.inflight {
+        if let Message::AppendEntries { entries, .. } = &m.message {
+            let bytes: usize = entries.iter().map(|e| e.encoded_len()).sum();
+            assert!(
+                entries.len() <= 1 || bytes <= budget,
+                "a message to node {} carried {} entries, {bytes} bytes, over a {budget} byte budget",
+                m.to,
+                entries.len()
+            );
+        }
+    }
+}
+
+/// The failure this exists for: a follower far enough behind that its
+/// backlog would not fit in one message. It has to be caught up in pieces,
+/// and no piece may be larger than the budget.
+#[test]
+fn a_far_behind_follower_is_caught_up_in_bounded_pieces() {
+    let config = small_batches();
+    let mut c = Cluster::with_config(3, config);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    let behind = (1..=3).find(|&id| id != leader).unwrap();
+    let rest: Vec<NodeId> = (1..=3).filter(|&id| id != behind).collect();
+
+    c.partition(&[&rest, &[behind]]);
+    for i in 0..60u8 {
+        c.propose(leader, &[i; 50]);
+        assert_messages_within(&c, config.max_append_bytes);
+        c.tick();
+    }
+    let last = c.node(leader).last_index();
+    c.run_until("the majority to commit", |c| c.committed_on(leader) >= last);
+
+    c.heal();
+    for _ in 0..500 {
+        assert_messages_within(&c, config.max_append_bytes);
+        if c.committed_on(behind) >= last {
+            break;
+        }
+        c.tick();
+    }
+    assert_eq!(c.committed_on(behind), last, "the follower never caught up");
+    assert_eq!(c.applied_data(behind), c.applied_data(leader));
+    c.assert_logs_agree();
+}
+
+/// Catching up must move at a batch per round trip, not a batch per
+/// heartbeat. Sixty entries at two a message is thirty batches; waiting
+/// for an eight-tick heartbeat each time would take well over two hundred
+/// ticks, while carrying straight on takes about sixty.
+#[test]
+fn catching_up_does_not_wait_for_heartbeats() {
+    let config = small_batches();
+    let mut c = Cluster::with_config(3, config);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    let behind = (1..=3).find(|&id| id != leader).unwrap();
+    let rest: Vec<NodeId> = (1..=3).filter(|&id| id != behind).collect();
+
+    c.partition(&[&rest, &[behind]]);
+    for i in 0..60u8 {
+        c.propose(leader, &[i; 50]);
+        c.tick();
+    }
+    let last = c.node(leader).last_index();
+    c.run_until("the majority to commit", |c| c.committed_on(leader) >= last);
+
+    c.heal();
+    let mut ticks = 0;
+    while c.committed_on(behind) < last {
+        c.tick();
+        ticks += 1;
+        assert!(
+            ticks < 150,
+            "catch-up is waiting on the heartbeat: {ticks} ticks and counting"
+        );
+    }
+}
+
+/// A command no message could carry is refused up front, because once in
+/// the log it would block everything behind it.
+#[test]
+fn a_command_too_large_to_replicate_is_refused() {
+    let mut c = Cluster::with_config(3, small_batches());
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    let before = c.node(leader).last_index();
+
+    match c.slots.get_mut(&leader) {
+        Some(Slot::Running(node)) => {
+            let err = node.propose(vec![0; 5000]).unwrap_err();
+            assert!(
+                matches!(err, minicask::raft::ProposeError::TooLarge { .. }),
+                "expected TooLarge, got {err}"
+            );
+        }
+        _ => panic!("the leader is not running"),
+    }
+    assert_eq!(c.node(leader).last_index(), before, "nothing was appended");
+}

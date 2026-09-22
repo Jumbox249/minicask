@@ -163,14 +163,14 @@ What it implements: elections with randomised timeouts, log replication with the
 
 ### What the tests actually prove
 
-Twenty-seven cluster scenarios and twenty-six protocol tests, including the ones a naive implementation passes and should not:
+Thirty cluster scenarios and twenty-six protocol tests, including the ones a naive implementation passes and should not:
 
 - **`a_stale_candidate_cannot_win_even_with_the_highest_term`** isolates a node until it has missed six committed entries and campaigned its term far above everyone else's, then heals the network with nothing in flight and makes it stand for election. Its term is high enough to depose the leader. Its log is not good enough to replace it, and the votes have to say so.
 - **`a_deposed_leader_steps_down_and_drops_its_orphan_entries`** feeds commands to a leader that has been cut off from everyone, then heals and requires those entries to be overwritten rather than applied.
 - **`commands_survive_relentless_churn`** runs twelve rounds of commit-then-break-something, checking after every round that no two nodes disagree about any index.
 - **`a_stale_append_does_not_shorten_the_log`** delivers a late duplicate that mentions fewer entries than the follower holds, and requires the extra ones to survive. Deleting what a message merely failed to mention is the classic way to lose a committed entry.
 
-A test suite that passes proves nothing on its own, so every safety rule here was checked by breaking it on purpose and confirming the suite noticed. Thirteen broken variants, each failing at least one test: removing the up-to-date check from voting, truncating the log on every append, trusting the leader's commit index, allowing two votes in one term, an off-by-one in the quorum, committing an earlier term's entry on a replica count, not standing down when cut off, not recording contact with peers, granting a pre-vote to a node that is behind, ignoring the log when answering one, dropping the leader lease, counting pre-vote replies from any round, and not echoing the proposed term on a grant.
+A test suite that passes proves nothing on its own, so every safety rule here was checked by breaking it on purpose and confirming the suite noticed. Eighteen broken variants, each failing at least one test: removing the up-to-date check from voting, truncating the log on every append, trusting the leader's commit index, allowing two votes in one term, an off-by-one in the quorum, committing an earlier term's entry on a replica count, not standing down when cut off, not recording contact with peers, granting a pre-vote to a node that is behind, ignoring the log when answering one, dropping the leader lease, counting pre-vote replies from any round, not echoing the proposed term on a grant, sending a lagging follower its whole backlog in one message, waiting for a heartbeat between catch-up batches, accepting a command too large to replicate, re-applying the log to the store on restart, and trusting a damaged applied index.
 
 The first attempt at this suite caught none of the subtle ones. Every scenario passed against three deliberately broken implementations, because the scenarios never built the interleavings those rules exist for. The rules that cannot be reached through ordinary operation — a leader committing an earlier term's entry is the clearest — are now tested against the state they guard, directly, rather than hoped for through a cluster.
 
@@ -196,9 +196,15 @@ A refusal carries the refuser's own term, which is how a node that really has fa
 
 The effect is that an isolated node's term does not move at all while it is away. One test holds a node out for three hundred ticks, heals the network, and then requires the leader's term to be exactly what it was before.
 
+### Catching up in pieces
+
+A follower that has been away is behind by however much the cluster wrote while it was gone. Sending that as one message fails twice over: the backlog goes out again in full on every heartbeat until it is acknowledged, and a backlog bigger than the 64 MiB frame limit can never be sent at all, so the follower never catches up.
+
+So each `AppendEntries` carries about `max_append_bytes` of entries (1 MiB by default), and an acknowledged batch is followed at once by the next rather than waiting for the heartbeat, which makes catch-up one batch per round trip. A batch always holds at least one entry, however large, so a single big entry cannot stall replication; `max_entry_bytes` (16 MiB) is the hard ceiling, and a `SET` past it is refused before it reaches the log, since once there it would block everything behind it. A cluster node will not start with limits that could add up to more than a frame.
+
 ### What it does not do yet
 
-- **No snapshots**, so a log grows forever and a node that falls far enough behind is caught up an entry at a time.
+- **No snapshots**, so a log grows forever, and a node that falls far behind is caught up by replaying it rather than by being sent a copy of the store.
 - **Fixed membership.** Adding or removing a node means restarting the cluster.
 - **Reads go to the leader**, so followers are redundancy and not read capacity.
 
@@ -239,6 +245,7 @@ Reads and writes both go to the leader. A follower's store is only as current as
 ```text
 n1/
   data/            the store, exactly as a single node writes it
+    applied-index  how far through the log the store has got
   raft/
     hard-state     term and vote, written to one side and renamed over the other
     entries        the consensus log, append-only, same record format as the store
@@ -248,13 +255,15 @@ Raft is only safe if a node's term, its vote and the entries it has acknowledged
 
 The log reuses the store's record format, which means its framing, its checksum and its torn-tail recovery are the code the single-node store has already been tested on. A half-written entry is dropped at startup; a flipped bit inside a complete one is reported rather than guessed at.
 
+A restarted node relearns its commit index from zero, so every committed entry is handed to it again. `applied-index` is what stops it writing the whole history into its store a second time on each restart: entries up to it are skipped. The store is synced before the index is written, never after, so the index cannot claim writes a power cut took away. It is only ever an optimisation, which is why a missing or damaged one is not an error: it falls back to zero, and replaying committed writes in order onto a store that already has some of them lands in the same state.
+
 ## Testing
 
 ```console
 $ cargo test
 ```
 
-145 tests, including the three that matter:
+154 tests, including the three that matter:
 
 - **`a_killed_writer_loses_nothing_it_finished`** spawns a real child process that writes 500 records, scribbles a header with no body onto the end of the file, then calls `abort()`. No destructor runs, no buffer is flushed, the kernel takes the process out with `SIGABRT`. The test then reopens the store and checks all 500 records, and that it is still writable afterwards.
 - **`corruption_in_a_sealed_file_is_reported`** flips a bit in a file that was already closed and asserts the store refuses to open rather than pretending.

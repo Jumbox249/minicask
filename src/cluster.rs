@@ -141,6 +141,17 @@ impl ClusterNode {
         client_addr: B,
         config: ClusterConfig,
     ) -> Result<ClusterNode> {
+        // The largest message a leader sends is one batch plus, at worst,
+        // one oversized entry. If that could pass the frame limit a peer
+        // would refuse it forever, which is the failure the budget exists
+        // to prevent, so refuse the configuration instead.
+        let worst = config.raft.max_append_bytes as u64 + config.raft.max_entry_bytes as u64;
+        if worst + 1024 > wire::MAX_FRAME as u64 {
+            return Err(crate::Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_append_bytes plus max_entry_bytes must stay under the frame limit",
+            )));
+        }
         let storage = DiskStorage::open(raft_dir)?;
         let store = Store::open(store_dir)?;
         let node = Node::new(config.id, config.ids(), config.raft, storage);

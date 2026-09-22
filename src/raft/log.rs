@@ -42,6 +42,22 @@ pub struct Entry {
     pub command: Command,
 }
 
+impl Entry {
+    /// Bytes this entry takes up inside an `AppendEntries` frame: term,
+    /// index, a tag and a length, then the command. Used to keep one
+    /// message under a size budget.
+    pub fn encoded_len(&self) -> usize {
+        let payload = match &self.command {
+            Command::Noop => 0,
+            Command::Data(bytes) => bytes.len(),
+        };
+        ENTRY_OVERHEAD + payload
+    }
+}
+
+/// Fixed bytes per entry on the wire: term, index, tag, length.
+pub const ENTRY_OVERHEAD: usize = 8 + 8 + 1 + 8;
+
 /// The part of a node's state that must reach disk before it replies to
 /// anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -108,6 +124,27 @@ pub trait StorageExt: Storage {
             }
         }
         index
+    }
+
+    /// Entries from `index` onwards, stopping before the total would pass
+    /// `max_bytes`.
+    ///
+    /// At least one entry is always returned when there is one, however
+    /// large, or a single entry bigger than the budget would stall
+    /// replication for good.
+    fn entries_within(&self, index: u64, max_bytes: usize) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let mut total = 0usize;
+        for i in index.max(1)..=self.last_index() {
+            let Some(entry) = self.entry(i) else { break };
+            let len = entry.encoded_len();
+            if !out.is_empty() && total + len > max_bytes {
+                break;
+            }
+            total += len;
+            out.push(entry.clone());
+        }
+        out
     }
 
     /// The last index belonging to `term`, or `None` if the log has no
@@ -255,6 +292,40 @@ mod tests {
         assert_eq!(s.last_index_of_term(1), Some(2));
         assert_eq!(s.last_index_of_term(3), Some(5));
         assert_eq!(s.last_index_of_term(9), None);
+    }
+
+    fn data(index: u64, len: usize) -> Entry {
+        Entry {
+            term: 1,
+            index,
+            command: Command::Data(vec![b'x'; len]),
+        }
+    }
+
+    #[test]
+    fn a_budgeted_read_stops_at_the_budget() {
+        let mut s = MemStorage::new();
+        let entries: Vec<Entry> = (1..=10).map(|i| data(i, 100)).collect();
+        s.append(&entries).unwrap();
+        let each = entries[0].encoded_len();
+
+        let batch = s.entries_within(1, each * 3);
+        assert_eq!(batch.len(), 3, "exactly three fit");
+        assert_eq!(batch[0].index, 1);
+
+        let batch = s.entries_within(9, each * 3);
+        assert_eq!(batch.len(), 2, "only two remain");
+
+        assert!(s.entries_within(11, each * 3).is_empty());
+    }
+
+    #[test]
+    fn an_entry_bigger_than_the_budget_is_still_sent_alone() {
+        let mut s = MemStorage::new();
+        s.append(&[data(1, 5000), data(2, 10)]).unwrap();
+        let batch = s.entries_within(1, 100);
+        assert_eq!(batch.len(), 1, "one oversized entry, and nothing after it");
+        assert_eq!(batch[0].index, 1);
     }
 
     #[test]

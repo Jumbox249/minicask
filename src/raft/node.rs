@@ -38,6 +38,17 @@ pub struct Config {
     /// perfectly healthy leader.
     pub election_timeout_min: u64,
     pub election_timeout_max: u64,
+    /// Roughly how many bytes of entries one `AppendEntries` may carry.
+    ///
+    /// Without a limit a follower that has fallen behind is sent its whole
+    /// backlog in one message, again on every heartbeat until it answers,
+    /// and a backlog past the transport's frame limit can never be sent
+    /// at all. A message always carries at least one entry, so this is a
+    /// target rather than a hard cap; `max_entry_bytes` is the hard cap.
+    pub max_append_bytes: usize,
+    /// The largest command `propose` will accept, so that any one entry
+    /// fits in a message.
+    pub max_entry_bytes: usize,
 }
 
 impl Default for Config {
@@ -46,6 +57,8 @@ impl Default for Config {
             heartbeat_ticks: 2,
             election_timeout_min: 10,
             election_timeout_max: 20,
+            max_append_bytes: 1024 * 1024,
+            max_entry_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -65,6 +78,9 @@ pub enum ProposeError {
     /// Only a leader may accept commands. Carries who to try instead, when
     /// this node has heard from a leader.
     NotLeader { leader: Option<NodeId> },
+    /// The command is bigger than `Config::max_entry_bytes`, so it could
+    /// never be replicated.
+    TooLarge { len: usize, max: usize },
     /// The entry could not be made durable, so it was not accepted.
     Storage(crate::Error),
 }
@@ -76,6 +92,12 @@ impl std::fmt::Display for ProposeError {
                 write!(f, "not the leader, try node {id}")
             }
             ProposeError::NotLeader { leader: None } => write!(f, "not the leader"),
+            ProposeError::TooLarge { len, max } => {
+                write!(
+                    f,
+                    "command of {len} bytes exceeds the {max} byte entry limit"
+                )
+            }
             ProposeError::Storage(e) => write!(f, "{e}"),
         }
     }
@@ -85,7 +107,7 @@ impl std::error::Error for ProposeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ProposeError::Storage(e) => Some(e),
-            ProposeError::NotLeader { .. } => None,
+            ProposeError::NotLeader { .. } | ProposeError::TooLarge { .. } => None,
         }
     }
 }
@@ -420,6 +442,15 @@ impl<S: Storage> Node<S> {
         if self.role != Role::Leader {
             return Err(ProposeError::NotLeader {
                 leader: self.leader_id,
+            });
+        }
+        let len = command.len() + super::log::ENTRY_OVERHEAD;
+        if len > self.config.max_entry_bytes {
+            // Accepting it would wedge the log: every later entry sits
+            // behind one that no message can carry.
+            return Err(ProposeError::TooLarge {
+                len,
+                max: self.config.max_entry_bytes,
             });
         }
         let index = self.append_local(Command::Data(command))?;
@@ -766,6 +797,13 @@ impl<S: Storage> Node<S> {
                 self.match_index.insert(from, match_index);
                 self.next_index.insert(from, match_index + 1);
                 self.maybe_commit();
+                // More to send: carry straight on rather than waiting for
+                // the next heartbeat, so a follower catching up moves at a
+                // batch per round trip. Only on real progress, so a stale
+                // or duplicate reply cannot start a second stream.
+                if match_index < self.storage.last_index() {
+                    actions.push(self.append_message_for(from));
+                }
             }
             return Ok(());
         }
@@ -831,7 +869,9 @@ impl<S: Storage> Node<S> {
                 // A `None` here means the leader has itself discarded that
                 // entry, which cannot happen without snapshots.
                 prev_log_term: self.storage.term_at(prev_log_index).unwrap_or(0),
-                entries: self.storage.entries_from(next),
+                entries: self
+                    .storage
+                    .entries_within(next, self.config.max_append_bytes),
                 leader_commit: self.commit_index,
             },
         }
