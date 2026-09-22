@@ -1,6 +1,6 @@
 # caskdb
 
-[![CI](https://github.com/Jumbox249/caskdb/actions/workflows/ci.yml/badge.svg)](https://github.com/Jumbox249/caskdb/actions/workflows/ci.yml)
+[![CI](https://github.com/Jumbox249/minicask/actions/workflows/ci.yml/badge.svg)](https://github.com/Jumbox249/minicask/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
