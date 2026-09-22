@@ -1,0 +1,21 @@
+[package]
+name = "caskdb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "An embedded append-only key/value store with crash recovery, written from scratch with zero dependencies."
+license = "MIT"
+readme = "README.md"
+keywords = ["database", "key-value", "storage", "bitcask", "embedded"]
+categories = ["database-implementations"]
+
+[[bin]]
+name = "caskdb"
+path = "src/bin/caskdb.rs"
+
+[[bin]]
+name = "caskdb-crash-writer"
+path = "src/bin/crash_writer.rs"
+
+[profile.release]
+debug = true
