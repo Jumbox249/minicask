@@ -24,8 +24,11 @@ mod crc;
 mod error;
 mod log;
 mod record;
+pub mod resp;
+mod server;
 mod store;
 
 pub use error::{Error, Result};
 pub use log::SyncPolicy;
+pub use server::Server;
 pub use store::{CompactReport, Location, Options, Stats, Store};

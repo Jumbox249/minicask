@@ -111,17 +111,45 @@ reclaimable  0 (0.0%)
 
 `get` and `del` exit with status 1 on a missing key, so they compose with shell scripts.
 
+## Redis-compatible server
+
+`minicask-server` puts the store behind a TCP port speaking RESP, the Redis wire protocol. The official `redis-cli` and the ordinary client libraries connect to it without knowing the difference.
+
+```console
+$ minicask-server --dir ./data
+listening on 127.0.0.1:6379
+```
+
+```console
+$ redis-cli SET greeting "hello world"
+OK
+$ redis-cli GET greeting
+"hello world"
+$ redis-cli DBSIZE
+(integer) 1
+```
+
+The commands it answers: `GET`, `SET` (with `NX` and `XX`), `MGET`, `MSET`, `DEL`, `EXISTS`, `KEYS`, `DBSIZE`, `FLUSHDB`, `PING`, `ECHO`, `SELECT 0`, `QUIT`, and enough of `COMMAND` and `CLIENT` for clients to finish their handshake. `SET` with an expiry is refused with a syntax error rather than accepted and forgotten, since the store has no clock to honour it with.
+
+Pipelining works: replies to a batch of commands go out in one write. Inline commands (`GET greeting` on a bare line) work too, so `telnet` and `nc` are enough to poke at it. A protocol error closes that one connection and no other.
+
+Concurrency is a mutex. The store is single-threaded by design, so each connection gets a thread and each command takes the lock for exactly one read or one append. That is the simplest correct thing, and it means the server's write throughput is the store's: 4.5k/sec with fsync on every write, 100x that with `--no-fsync`.
+
+`src/resp.rs` is both halves of the protocol, and `minicask::resp::read_reply` is what the test suite uses as a client.
+
 ## Testing
 
 ```console
 $ cargo test
 ```
 
-27 tests, including the three that matter:
+47 tests, including the three that matter:
 
 - **`a_killed_writer_loses_nothing_it_finished`** spawns a real child process that writes 500 records, scribbles a header with no body onto the end of the file, then calls `abort()`. No destructor runs, no buffer is flushed, the kernel takes the process out with `SIGABRT`. The test then reopens the store and checks all 500 records, and that it is still writable afterwards.
 - **`corruption_in_a_sealed_file_is_reported`** flips a bit in a file that was already closed and asserts the store refuses to open rather than pretending.
 - **`deleted_keys_do_not_come_back_after_a_compaction`** guards the ordering rule that makes compaction safe.
+
+`tests/server.rs` starts the real `minicask-server` binary and talks to it over a socket: pipelining, inline commands, binary-safe values, eight clients writing at once, a protocol error that must not affect other connections, and a `kill` followed by a restart on the same directory.
 
 ## Layout
 
@@ -130,7 +158,9 @@ src/crc.rs      CRC-32, table built at compile time
 src/record.rs   the on-disk record format
 src/log.rs      data files, the append writer, the recovery scanner
 src/store.rs    the index, the read path, recovery, compaction
-src/bin/        the CLI, and the crash-test helper
+src/resp.rs     the Redis wire protocol, both directions
+src/server.rs   the TCP server and its command table
+src/bin/        the CLI, the server, and the crash-test helper
 ```
 
 ## What it does not do
@@ -138,7 +168,7 @@ src/bin/        the CLI, and the crash-test helper
 Worth being straight about, since each of these is a design choice rather than an oversight:
 
 - **Keys must fit in memory.** The index is a `HashMap`, so memory scales with key count, not data size.
-- **Single process, single thread.** There is no file lock and no internal synchronisation. Two `Store` instances on one directory will corrupt each other.
+- **Single process, single thread.** There is no file lock and no internal synchronisation. Two `Store` instances on one directory will corrupt each other. The server puts one store behind one mutex, which is why it has one.
 - **Startup reads every byte.** Recovery verifies the checksum of each record, which means replay is proportional to data size rather than key count. Bitcask solves this with hint files, which would be the next thing to build.
 - **Compaction is stop-the-world.** It blocks until the merge finishes.
 - **No range scans.** A hash index cannot answer ordered queries.

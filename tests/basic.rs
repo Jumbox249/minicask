@@ -1,7 +1,7 @@
 mod common;
 
-use minicask::{Error, Store};
 use common::TempDir;
+use minicask::{Error, Store};
 
 #[test]
 fn put_then_get() {

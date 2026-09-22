@@ -3,8 +3,8 @@
 
 mod common;
 
-use minicask::{Error, Options, Store};
 use common::{corrupt_byte, TempDir};
+use minicask::{Error, Options, Store};
 use std::io::Write;
 use std::process::Command;
 

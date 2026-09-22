@@ -3,8 +3,8 @@
 
 mod common;
 
-use minicask::{Options, Store};
 use common::TempDir;
+use minicask::{Options, Store};
 
 #[test]
 fn compaction_reclaims_overwritten_records() {
