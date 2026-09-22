@@ -163,7 +163,7 @@ What it implements: elections with randomised timeouts, log replication with the
 
 ### What the tests actually prove
 
-Nineteen cluster scenarios and thirteen protocol tests, including the ones a naive implementation passes and should not:
+Twenty-seven cluster scenarios and twenty-six protocol tests, including the ones a naive implementation passes and should not:
 
 - **`a_stale_candidate_cannot_win_even_with_the_highest_term`** isolates a node until it has missed six committed entries and campaigned its term far above everyone else's, then heals the network with nothing in flight and makes it stand for election. Its term is high enough to depose the leader. Its log is not good enough to replace it, and the votes have to say so.
 - **`a_deposed_leader_steps_down_and_drops_its_orphan_entries`** feeds commands to a leader that has been cut off from everyone, then heals and requires those entries to be overwritten rather than applied.
@@ -254,7 +254,7 @@ The log reuses the store's record format, which means its framing, its checksum 
 $ cargo test
 ```
 
-144 tests, including the three that matter:
+145 tests, including the three that matter:
 
 - **`a_killed_writer_loses_nothing_it_finished`** spawns a real child process that writes 500 records, scribbles a header with no body onto the end of the file, then calls `abort()`. No destructor runs, no buffer is flushed, the kernel takes the process out with `SIGABRT`. The test then reopens the store and checks all 500 records, and that it is still writable afterwards.
 - **`corruption_in_a_sealed_file_is_reported`** flips a bit in a file that was already closed and asserts the store refuses to open rather than pretending.

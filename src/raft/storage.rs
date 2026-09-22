@@ -242,7 +242,21 @@ fn recover(file: &mut File) -> Result<(Vec<Entry>, Vec<u64>, u64)> {
             break;
         }
 
-        let mut body = vec![0u8; (header.key_len + header.value_len) as usize];
+        // Summed as u64, the way `record_len` does it: two u32 lengths can
+        // total more than a u32 holds, and a corrupt header is exactly
+        // where that would happen. The size check above already refuses a
+        // record that runs past the file, so this only matters for a log
+        // large enough to get here, but guessing at a length is how a
+        // reader turns damage into a panic.
+        let body_len = header.key_len as u64 + header.value_len as u64;
+        let Ok(body_len) = usize::try_from(body_len) else {
+            return Err(Error::Corrupt {
+                file_id: 0,
+                offset: at,
+                detail: "raft log record is larger than this machine can address",
+            });
+        };
+        let mut body = vec![0u8; body_len];
         match reader.read_exact(&mut body) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
@@ -525,6 +539,39 @@ mod tests {
         // And the log is writable again, at the index that was lost.
         storage.append(&entries(&[(3, 2)])).unwrap();
         assert_eq!(storage.term_at(3), Some(2));
+    }
+
+    /// A header claiming lengths far past the end of the file is what a
+    /// crash mid-header leaves, not a record. It must be treated as a torn
+    /// tail rather than believed and acted on.
+    #[test]
+    fn an_absurd_length_is_not_believed() {
+        let dir = Dir::new("absurd-length");
+        let good_size;
+        {
+            let mut storage = DiskStorage::open(&dir.0).unwrap();
+            storage.append(&entries(&[(1, 1)])).unwrap();
+            good_size = storage.disk_bytes();
+        }
+        {
+            // key_len and value_len both at u32::MAX, which also happens to
+            // overflow a u32 when summed.
+            let mut header = [0u8; HEADER_LEN];
+            header[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+            header[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(dir.0.join("entries"))
+                .unwrap();
+            file.write_all(&header).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let mut storage = DiskStorage::open(&dir.0).unwrap();
+        assert_eq!(storage.last_index(), 1, "the real entry should survive");
+        assert_eq!(storage.disk_bytes(), good_size, "the tail should be gone");
+        storage.append(&entries(&[(2, 1)])).unwrap();
+        assert_eq!(storage.last_index(), 2);
     }
 
     #[test]
