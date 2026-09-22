@@ -240,7 +240,7 @@ fn wrong_arity(name: &str) -> Reply {
 
 /// The subset of Redis glob syntax that `KEYS` needs: `*`, `?` and
 /// backslash escapes. Character classes are treated as literals.
-fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+pub(crate) fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     match (pattern.split_first(), text.split_first()) {
         (None, None) => true,
         (None, Some(_)) => false,

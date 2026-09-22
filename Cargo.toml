@@ -18,6 +18,10 @@ name = "minicask-server"
 path = "src/bin/server.rs"
 
 [[bin]]
+name = "minicask-cluster"
+path = "src/bin/cluster.rs"
+
+[[bin]]
 name = "minicask-crash-writer"
 path = "src/bin/crash_writer.rs"
 

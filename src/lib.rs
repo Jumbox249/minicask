@@ -20,16 +20,20 @@
 //! # Ok::<(), minicask::Error>(())
 //! ```
 
+mod cluster;
 mod crc;
 mod error;
 mod log;
 pub mod raft;
 mod record;
+mod replicated;
 pub mod resp;
 mod server;
 mod store;
 
+pub use cluster::{ClusterConfig, ClusterNode, Peer};
 pub use error::{Error, Result};
 pub use log::SyncPolicy;
+pub use replicated::{Op, ReplicatedStore};
 pub use server::Server;
 pub use store::{CompactReport, Location, Options, Stats, Store};

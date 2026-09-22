@@ -924,15 +924,90 @@ fn a_returning_leader_does_not_resume_command() {
         rest.iter().all(|&id| c.committed_on(id) >= last)
     });
 
-    // The old leader still believes it leads, right up to the first reply.
-    assert!(
-        c.node(old).is_leader(),
-        "it has heard nothing to say otherwise"
-    );
+    // It has heard nothing from anyone, and cannot: it is on the wrong
+    // side of the cut. It has to work out on its own that it is finished,
+    // or it would go on answering reads from a store the majority has
+    // already moved past.
+    c.run_until("the cut-off leader to stand down unprompted", |c| {
+        c.node(old).role() != Role::Leader
+    });
     c.heal();
     c.run_until("the old leader to stand down", |c| {
         c.node(old).role() == Role::Follower
     });
     assert_eq!(c.leaders(), vec![new], "there should be exactly one leader");
+    c.assert_logs_agree();
+}
+
+/// A leader hears nothing from a partition it is on the wrong side of, so
+/// nothing will ever tell it that it has been replaced. Left alone it would
+/// keep answering reads from a store the majority has moved past.
+#[test]
+fn a_leader_cut_off_from_the_majority_stands_down_on_its_own() {
+    let mut c = Cluster::new(5);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    let rest: Vec<NodeId> = (1..=5).filter(|&id| id != leader).collect();
+
+    c.partition(&[&[leader], &rest]);
+    c.run_until("the cut-off leader to give up", |c| {
+        c.node(leader).role() != Role::Leader
+    });
+
+    // It keeps its term: nothing has been decided, it has only stopped
+    // claiming an office it can no longer do the job of.
+    assert_eq!(c.node(leader).leader(), None);
+}
+
+/// The other half of that: a leader with a majority must not stand itself
+/// down, however long it runs.
+#[test]
+fn a_leader_with_a_majority_stays_in_office() {
+    let mut c = Cluster::new(5);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    let term = c.node(leader).term();
+
+    // Lose one node, which still leaves four of five.
+    let victim = (1..=5).find(|&id| id != leader).unwrap();
+    c.kill(victim);
+    c.tick_n(300);
+
+    assert_eq!(c.leader(), Some(leader), "a healthy leader stood down");
+    assert_eq!(c.node(leader).term(), term, "an unnecessary election ran");
+}
+
+/// And a leader that loses its majority and gets it back carries on.
+#[test]
+fn a_leader_that_stands_down_can_be_re_elected() {
+    let mut c = Cluster::new(3);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    c.propose(leader, b"before");
+    c.run_until("the write to commit", |c| {
+        c.running().all(|n| n.commit_index() >= 2)
+    });
+
+    let rest: Vec<NodeId> = (1..=3).filter(|&id| id != leader).collect();
+    c.partition(&[&[leader], &rest]);
+    c.run_until("the cut-off leader to give up", |c| {
+        c.node(leader).role() != Role::Leader
+    });
+
+    c.heal();
+    c.run_until("the cluster to settle", |c| c.leader().is_some());
+    let leader = c.leader().expect("a leader");
+    c.propose(leader, b"after");
+    let last = c.node(leader).last_index();
+    c.run_until("the cluster to commit again", |c| {
+        c.running().all(|n| n.commit_index() >= last)
+    });
+    for id in 1..=3 {
+        assert_eq!(
+            c.applied_data(id),
+            vec![b"before".to_vec(), b"after".to_vec()],
+            "node {id}"
+        );
+    }
     c.assert_logs_agree();
 }

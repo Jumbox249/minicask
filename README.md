@@ -170,16 +170,71 @@ Nineteen cluster scenarios and thirteen protocol tests, including the ones a nai
 - **`commands_survive_relentless_churn`** runs twelve rounds of commit-then-break-something, checking after every round that no two nodes disagree about any index.
 - **`a_stale_append_does_not_shorten_the_log`** delivers a late duplicate that mentions fewer entries than the follower holds, and requires the extra ones to survive. Deleting what a message merely failed to mention is the classic way to lose a committed entry.
 
-A test suite that passes proves nothing on its own, so the safety rules were checked by breaking them on purpose. Removing the up-to-date check from voting, truncating the log on every append, trusting the leader's commit index, or allowing two votes in one term each fail the suite.
+A test suite that passes proves nothing on its own, so every safety rule here was checked by breaking it on purpose and confirming the suite noticed. Removing the up-to-date check from voting, truncating the log on every append, trusting the leader's commit index, allowing two votes in one term, an off-by-one in the quorum, committing an earlier term's entry on a replica count, not standing down when cut off, and not recording contact with peers — each one fails at least one test.
 
-One mutation does *not* fail it, which is worth saying plainly: dropping the rule that a leader may only commit entries from its own term. That rule is unreachable here, because `next_index` is set before the leader appends its no-op, so every `AppendEntries` it ever sends includes that no-op, and a successful reply therefore always reports a match at or past it. The check stays as defence in depth for the day that stops being true.
+The first attempt at this suite caught none of the subtle ones. Every scenario passed against three deliberately broken implementations, because the scenarios never built the interleavings those rules exist for. The rules that cannot be reached through ordinary operation — a leader committing an earlier term's entry is the clearest — are now tested against the state they guard, directly, rather than hoped for through a cluster.
+
+### Standing down
+
+Plain Raft never tells a leader it has been cut off. It keeps the title until it hears a later term, and it cannot hear one from the wrong side of a partition, so it goes on answering reads from a store the majority has long since moved past. Two rules close that:
+
+- **Check quorum.** A leader that cannot account for a majority within one election timeout stands itself down. It keeps its term, since nothing has been decided; it only stops claiming an office it can no longer do the job of.
+- **A new leader waits before it reads.** Winning an election is not enough. A new leader holds every committed entry, by the rule that decides a vote, but it does not yet know *which* of them are committed — a follower learns that from the leader's next message, and the old leader may have died before sending one. Committing the no-op from its own term settles it, and until then the node will not answer a read.
+
+The second of those was found by a test that failed only when the suite ran in parallel: a `GET` for a write that had already been acknowledged came back empty, in the window between an election being won and the backlog being applied.
 
 ### What it does not do yet
 
-- **Storage is in memory.** The `Storage` trait is the seam, and the test harness models a crash honestly by dropping the node and keeping the storage. Backing it with the append-only files this repository already has is the next piece of work.
-- **Nothing is wired to the store.** The consensus layer moves opaque bytes; making `SET` and `DEL` into replicated commands is what turns this into a replicated database rather than a Raft implementation sitting beside one.
 - **No snapshots**, so a log grows forever and a node that falls far enough behind is caught up an entry at a time.
 - **Fixed membership.** Adding or removing a node means restarting the cluster.
+- **No pre-vote.** A node returning from a partition has a high term and forces a fresh election, which costs a round trip. It cannot win one — the up-to-date rule sees to that, and there is a test for it — so this is wasted work rather than a safety problem.
+- **Reads go to the leader**, so followers are redundancy and not read capacity.
+
+## A replicated store
+
+`minicask-cluster` is the store with consensus underneath it. Three of them tolerate any one dying; five tolerate two.
+
+```console
+$ minicask-cluster --id 1 --dir ./n1 --raft 127.0.0.1:7001 --client 127.0.0.1:6001       --peer 2@127.0.0.1:7002,127.0.0.1:6002 --peer 3@127.0.0.1:7003,127.0.0.1:6003
+node 1 listening raft=127.0.0.1:7001 client=127.0.0.1:6001
+```
+
+Clients are still `redis-cli`. A write is not acknowledged until a majority has it on disk:
+
+```console
+$ redis-cli -p 6003 SET language rust
+OK
+$ redis-cli -p 6001 GET language          # a follower
+MOVED 0 127.0.0.1:6003
+$ redis-cli -p 6003 RAFT
+id:3
+role:leader
+term:1
+leader:3
+commit_index:3
+applied_index:3
+keys:1
+```
+
+Kill node 3 and the other two elect a replacement in well under a second, with every acknowledged write intact. Start it again and it comes back off its own disk, learns it is behind, and is caught up by the new leader.
+
+`SET` and `DEL` become `Op::Put` and `Op::Delete`, encoded in the store's own record format, so a command on the wire is checksummed and a delete is the same tombstone the store has always understood. The consensus layer never looks inside one.
+
+Reads and writes both go to the leader. A follower's store is only as current as the last entry it applied, so answering from one would hand back a value that a later read could contradict.
+
+### Where the durability lives
+
+```text
+n1/
+  data/            the store, exactly as a single node writes it
+  raft/
+    hard-state     term and vote, written to one side and renamed over the other
+    entries        the consensus log, append-only, same record format as the store
+```
+
+Raft is only safe if a node's term, its vote and the entries it has acknowledged are on the platter before it replies, so every one of those writes is fsynced. That is not a tunable. `--no-fsync` exists for a single node that has chosen speed over a power cut; a node that acknowledges what it has not stored can lose a committed write, which is the one thing consensus exists to prevent.
+
+The log reuses the store's record format, which means its framing, its checksum and its torn-tail recovery are the code the single-node store has already been tested on. A half-written entry is dropped at startup; a flipped bit inside a complete one is reported rather than guessed at.
 
 ## Testing
 
@@ -187,13 +242,13 @@ One mutation does *not* fail it, which is worth saying plainly: dropping the rul
 $ cargo test
 ```
 
-78 tests, including the three that matter:
+129 tests, including the three that matter:
 
 - **`a_killed_writer_loses_nothing_it_finished`** spawns a real child process that writes 500 records, scribbles a header with no body onto the end of the file, then calls `abort()`. No destructor runs, no buffer is flushed, the kernel takes the process out with `SIGABRT`. The test then reopens the store and checks all 500 records, and that it is still writable afterwards.
 - **`corruption_in_a_sealed_file_is_reported`** flips a bit in a file that was already closed and asserts the store refuses to open rather than pretending.
 - **`deleted_keys_do_not_come_back_after_a_compaction`** guards the ordering rule that makes compaction safe.
 
-`tests/raft.rs` is a deterministic cluster harness, described above. `tests/server.rs` starts the real `minicask-server` binary and talks to it over a socket: pipelining, inline commands, binary-safe values, eight clients writing at once, a protocol error that must not affect other connections, and a `kill` followed by a restart on the same directory.
+`tests/raft.rs` is a deterministic cluster harness, described above. `tests/replicated.rs` runs three replicas on real files through partitions, leader kills and restarts, checking after every round that no two of them hold different data. `tests/cluster.rs` starts three actual `minicask-cluster` processes and does it over TCP. `tests/server.rs` starts the real `minicask-server` binary and talks to it over a socket: pipelining, inline commands, binary-safe values, eight clients writing at once, a protocol error that must not affect other connections, and a `kill` followed by a restart on the same directory.
 
 ## Layout
 
@@ -204,7 +259,9 @@ src/log.rs      data files, the append writer, the recovery scanner
 src/store.rs    the index, the read path, recovery, compaction
 src/resp.rs     the Redis wire protocol, both directions
 src/server.rs   the TCP server and its command table
-src/raft/       consensus: the log, the RPCs, the state machine
+src/raft/       consensus: the log, the RPCs, the state machine, the wire
+src/replicated.rs  committed entries applied to the store
+src/cluster.rs  a replicated node as a running process
 src/bin/        the CLI, the server, and the crash-test helper
 ```
 
@@ -214,6 +271,7 @@ Worth being straight about, since each of these is a design choice rather than a
 
 - **Keys must fit in memory.** The index is a `HashMap`, so memory scales with key count, not data size.
 - **Single process, single thread.** There is no file lock and no internal synchronisation. Two `Store` instances on one directory will corrupt each other. The server puts one store behind one mutex, which is why it has one.
+- **One store is still one disk.** `minicask-cluster` is the answer to that, and it is a different set of trade-offs rather than a strictly better one: every write costs a network round trip and a majority of fsyncs.
 - **Startup reads every byte.** Recovery verifies the checksum of each record, which means replay is proportional to data size rather than key count. Bitcask solves this with hint files, which would be the next thing to build.
 - **Compaction is stop-the-world.** It blocks until the merge finishes.
 - **No range scans.** A hash index cannot answer ordered queries.

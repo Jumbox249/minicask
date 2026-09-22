@@ -136,6 +136,13 @@ pub struct Node<S: Storage> {
     last_applied: u64,
 
     votes: HashSet<NodeId>,
+    /// The index of the no-op this node appended on taking office. Until
+    /// that commits, a leader knows the log but not which of it is
+    /// committed, so it is not yet fit to answer reads.
+    leader_start: u64,
+    /// Peers heard from since the last quorum check. A leader that cannot
+    /// find a majority in here has been cut off and stands down.
+    active: HashSet<NodeId>,
     next_index: HashMap<NodeId, u64>,
     match_index: HashMap<NodeId, u64>,
 
@@ -164,6 +171,8 @@ impl<S: Storage> Node<S> {
             commit_index: 0,
             last_applied: 0,
             votes: HashSet::new(),
+            leader_start: 0,
+            active: HashSet::new(),
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             election_elapsed: 0,
@@ -198,6 +207,20 @@ impl<S: Storage> Node<S> {
         self.commit_index
     }
 
+    /// Whether this node is a leader that may answer a read.
+    ///
+    /// Winning an election is not enough. A new leader holds every
+    /// committed entry, by the up-to-date rule, but it does not yet know
+    /// which of them are committed: a follower learns that from the next
+    /// `AppendEntries`, and the old leader may have died before sending
+    /// one. Reading in that window can miss a write that was acknowledged.
+    ///
+    /// Committing the no-op from its own term settles it, because
+    /// everything earlier commits along with it.
+    pub fn ready_to_serve(&self) -> bool {
+        self.role == Role::Leader && self.commit_index >= self.leader_start
+    }
+
     pub fn last_index(&self) -> u64 {
         self.storage.last_index()
     }
@@ -221,6 +244,29 @@ impl<S: Storage> Node<S> {
                 if self.heartbeat_elapsed >= self.config.heartbeat_ticks {
                     self.heartbeat_elapsed = 0;
                     self.broadcast_append(&mut actions)?;
+                }
+
+                // Check quorum. Raft on its own never tells a leader it has
+                // been cut off: it keeps the title until it hears a later
+                // term, which it cannot hear from the wrong side of a
+                // partition. A leader that believes it still leads will
+                // happily answer reads, and those reads are already stale,
+                // because the majority has moved on without it.
+                //
+                // So a leader that cannot account for a majority within one
+                // election timeout stands itself down. The term is kept,
+                // since nothing has been decided; only the office is given
+                // up.
+                self.election_elapsed += 1;
+                if self.election_elapsed >= self.election_timeout {
+                    self.active.insert(self.id);
+                    let reachable = self.active.len();
+                    self.active.clear();
+                    if !self.has_majority(reachable) {
+                        self.become_follower(self.term(), None)?;
+                    } else {
+                        self.election_elapsed = 0;
+                    }
                 }
             }
             Role::Follower | Role::Candidate => {
@@ -341,6 +387,7 @@ impl<S: Storage> Node<S> {
         self.role = Role::Follower;
         self.leader_id = leader;
         self.votes.clear();
+        self.active.clear();
         if term != previous.term {
             self.storage.save_hard_state(HardState {
                 term,
@@ -388,6 +435,8 @@ impl<S: Storage> Node<S> {
         self.role = Role::Leader;
         self.leader_id = Some(self.id);
         self.heartbeat_elapsed = 0;
+        self.election_elapsed = 0;
+        self.active.clear();
 
         let next = self.storage.last_index() + 1;
         self.next_index.clear();
@@ -400,8 +449,9 @@ impl<S: Storage> Node<S> {
         }
 
         // See `Command::Noop`: this is what makes entries from earlier
-        // terms committable.
-        self.append_local(Command::Noop)?;
+        // terms committable, and what tells this node when it has caught
+        // up enough to be trusted with a read.
+        self.leader_start = self.append_local(Command::Noop)?;
         self.broadcast_append(actions)
     }
 
@@ -559,6 +609,9 @@ impl<S: Storage> Node<S> {
         if self.role != Role::Leader || term != self.term() {
             return Ok(());
         }
+        // A reply of either kind proves this peer is reachable and still
+        // accepts us, which is what the quorum check counts.
+        self.active.insert(from);
 
         if success {
             // Replies can arrive out of order, so never move a follower's
@@ -685,6 +738,26 @@ impl<S: Storage> Node<S> {
     fn reset_election_timer(&mut self) {
         self.election_elapsed = 0;
         self.election_timeout = random_timeout(&mut self.rng, &self.config);
+    }
+}
+
+#[cfg(test)]
+impl<S: Storage> Node<S> {
+    /// Put the node in office with a given view of its followers, without
+    /// running an election or appending the usual no-op.
+    ///
+    /// This exists to test [`maybe_commit`](Node::maybe_commit) in
+    /// isolation. Through the ordinary path the no-op makes the
+    /// current-term rule unreachable, since every `AppendEntries` a leader
+    /// sends includes it, so the only way to exercise the rule is to build
+    /// the state it guards against directly.
+    fn leader_with(&mut self, followers: &[(NodeId, u64)]) {
+        self.role = Role::Leader;
+        self.leader_id = Some(self.id);
+        for &(id, matched) in followers {
+            self.match_index.insert(id, matched);
+            self.next_index.insert(id, matched + 1);
+        }
     }
 }
 
@@ -912,6 +985,58 @@ mod tests {
     }
 
     // -- commit ---------------------------------------------------------
+
+    /// Figure 8 of the paper. A leader has an entry from an earlier term
+    /// sitting on a majority of logs. Counting replicas alone would call it
+    /// committed, and a later leader could still overwrite it, because
+    /// nothing about those replicas came from a term this leader can speak
+    /// for.
+    #[test]
+    fn an_entry_from_an_earlier_term_is_not_committed_by_counting_replicas() {
+        let mut node = follower(5, &[(1, 1), (2, 1)]);
+        node.leader_with(&[(2, 2), (3, 2)]);
+        assert_eq!(node.term(), 5, "the log is entirely from earlier terms");
+
+        node.maybe_commit();
+        assert_eq!(
+            node.commit_index(),
+            0,
+            "committed an earlier term's entry on a replica count alone"
+        );
+    }
+
+    /// The other half of the rule: once one entry from the leader's own
+    /// term commits, everything behind it commits with it. That is what
+    /// the no-op on taking office is for.
+    #[test]
+    fn committing_the_current_term_carries_the_backlog_with_it() {
+        let mut node = follower(5, &[(1, 1), (2, 1), (3, 5)]);
+        node.leader_with(&[(2, 3), (3, 3)]);
+
+        node.maybe_commit();
+        assert_eq!(
+            node.commit_index(),
+            3,
+            "an entry from this term should commit, and carry the rest"
+        );
+    }
+
+    /// And a majority really is required, not a plurality.
+    #[test]
+    fn a_minority_of_replicas_commits_nothing() {
+        let mut node = follower(5, &[(1, 5), (2, 5)]);
+        // Five nodes, so two matching followers plus the leader is three
+        // of five, a majority; one plus the leader is not.
+        node.peers = vec![2, 3, 4, 5];
+        node.leader_with(&[(2, 2), (3, 0), (4, 0), (5, 0)]);
+
+        node.maybe_commit();
+        assert_eq!(node.commit_index(), 0, "committed without a majority");
+
+        node.leader_with(&[(3, 2)]);
+        node.maybe_commit();
+        assert_eq!(node.commit_index(), 2, "a majority should commit");
+    }
 
     #[test]
     fn a_delayed_message_cannot_drag_the_commit_index_forward() {
