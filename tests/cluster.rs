@@ -15,20 +15,37 @@ use minicask::resp::{self, Reply};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Elections take 10 to 20 ticks, so a short tick keeps these quick.
 const TICK_MS: u64 = 20;
 const PATIENCE: Duration = Duration::from_secs(20);
 
-/// Ask the OS for a free port and immediately hand it back. There is a
-/// window before the node binds it, which nothing else here is racing for.
+/// A port nothing in this test process has been given before.
+///
+/// Asking the OS for port 0 and letting it go is not enough on its own: the
+/// port goes back in the pool the moment it is released, and the next ask,
+/// from this test or one running beside it, can get the same one. Two
+/// nodes handed the same port means one of them cannot bind, and the
+/// cluster never forms. So every port handed out is remembered, and a
+/// repeat is asked for again. Another process on the machine could still
+/// take one in the moment before the node binds it, but nothing in here
+/// can.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the port")
-        .port()
+    static GIVEN: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    let mut given = GIVEN.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("bind an ephemeral port")
+            .local_addr()
+            .expect("read the port")
+            .port();
+        if !given.contains(&port) {
+            given.push(port);
+            return port;
+        }
+    }
 }
 
 struct Node {
@@ -37,6 +54,8 @@ struct Node {
     raft_addr: String,
     client_addr: String,
     dir: String,
+    /// Extra command-line flags, the same for every node.
+    extra: Vec<String>,
 }
 
 struct Cluster {
@@ -46,8 +65,12 @@ struct Cluster {
 
 impl Cluster {
     fn start(size: u64) -> Cluster {
+        Cluster::start_with(size, &[])
+    }
+
+    fn start_with(size: u64, extra: &[&str]) -> Cluster {
         let root = TempDir::new("cluster");
-        let mut nodes: Vec<Node> = (1..=size)
+        let nodes: Vec<Node> = (1..=size)
             .map(|id| Node {
                 id,
                 child: None,
@@ -59,13 +82,18 @@ impl Cluster {
                     .to_str()
                     .expect("utf-8 path")
                     .to_string(),
+                extra: extra.iter().map(|s| s.to_string()).collect(),
             })
             .collect();
 
-        for i in 0..nodes.len() {
-            spawn(&mut nodes, i);
+        // Built before anything is started, so that if a node fails to
+        // come up the ones already running are killed by `Drop` as the
+        // panic unwinds, instead of outliving the test.
+        let mut cluster = Cluster { nodes, _root: root };
+        for i in 0..cluster.nodes.len() {
+            spawn(&mut cluster.nodes, i);
         }
-        Cluster { nodes, _root: root }
+        cluster
     }
 
     fn client_addr(&self, id: u64) -> &str {
@@ -189,7 +217,8 @@ fn spawn(nodes: &mut [Node], index: usize) {
         .args(["--dir", &dir])
         .args(["--raft", &raft_addr])
         .args(["--client", &client_addr])
-        .args(["--tick-ms", &TICK_MS.to_string()]);
+        .args(["--tick-ms", &TICK_MS.to_string()])
+        .args(&nodes[index].extra);
     for peer in nodes.iter().filter(|n| n.id != id) {
         command.args([
             "--peer",
@@ -205,13 +234,13 @@ fn spawn(nodes: &mut [Node], index: usize) {
     // The node announces both addresses once it is listening, so this is
     // also the signal that it is ready to be connected to.
     let mut line = String::new();
-    BufReader::new(child.stdout.take().expect("stdout is piped"))
-        .read_line(&mut line)
-        .expect("read the listening line");
-    assert!(
-        line.contains("listening"),
-        "unexpected first line from node {id}: {line:?}"
-    );
+    let read = BufReader::new(child.stdout.take().expect("stdout is piped")).read_line(&mut line);
+    if read.is_err() || !line.contains("listening") {
+        // Not tracked by the cluster yet, so nothing else would kill it.
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("node {id} did not start; its first line was {line:?}");
+    }
 
     nodes[index].child = Some(child);
 }
@@ -360,4 +389,57 @@ fn a_minority_refuses_to_serve() {
     c.restart(doomed[0]);
     let leader = c.await_leader();
     assert_eq!(c.command(leader, &[b"GET", b"k"]), bulk("v"));
+}
+
+/// Snapshots across real processes: a node down long enough that the
+/// others compact past everything it holds comes back, is sent the state
+/// over TCP, and does not resurrect a key deleted while it was away.
+#[test]
+fn a_node_down_past_the_compacted_log_is_caught_up_by_snapshot() {
+    let mut c = Cluster::start_with(3, &["--snapshot-every", "5"]);
+    let leader = c.await_leader();
+    assert_eq!(c.command(leader, &[b"SET", b"doomed", b"yes"]), Reply::ok());
+
+    let away = c.ids().into_iter().find(|&id| id != leader).expect("one");
+    c.poll("the doomed key to reach every node", || {
+        (c.field(away, "keys").as_deref() == Some("1")).then_some(())
+    });
+    c.kill(away);
+
+    assert_eq!(c.command(leader, &[b"DEL", b"doomed"]), Reply::ok());
+    for i in 0..30 {
+        let key = format!("k{i}");
+        assert_eq!(
+            c.command(leader, &[b"SET", key.as_bytes(), b"v"]),
+            Reply::ok()
+        );
+    }
+    let compacted: u64 = c
+        .field(leader, "snapshot_index")
+        .and_then(|v| v.parse().ok())
+        .expect("a snapshot index");
+    assert!(compacted >= 25, "the leader never compacted: {compacted}");
+
+    c.restart(away);
+    c.poll("the returning node to catch up", || {
+        (c.field(away, "keys").as_deref() == Some("30")).then_some(())
+    });
+    let installed: u64 = c
+        .field(away, "snapshot_index")
+        .and_then(|v| v.parse().ok())
+        .expect("a snapshot index");
+    assert!(
+        installed > 0,
+        "it caught up without ever holding a snapshot"
+    );
+
+    // Only the leader answers reads, so ask it to confirm the key is gone
+    // everywhere by checking every node holds exactly the thirty.
+    assert_eq!(
+        c.command(leader, &[b"EXISTS", b"doomed"]),
+        Reply::Integer(0)
+    );
+    for id in c.ids() {
+        assert_eq!(c.field(id, "keys").as_deref(), Some("30"), "node {id}");
+    }
 }
