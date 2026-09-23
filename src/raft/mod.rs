@@ -40,5 +40,5 @@ pub use log::{
     Storage, StorageExt,
 };
 pub use message::{Action, Message};
-pub use node::{Accepted, Config, Node, ProposeError, Role};
+pub use node::{Accepted, Config, Node, ProposeError, ReadRequest, ReadState, Role};
 pub use storage::{DiskSnapshot, DiskStorage};

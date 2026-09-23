@@ -22,7 +22,7 @@ const PREFIX_LEN: usize = 20;
 /// A frame beyond this is garbage or a hostile peer, not a message.
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
-/// Tags for the four message types.
+/// Tags for the message types.
 const REQUEST_VOTE: u8 = 1;
 const REQUEST_VOTE_REPLY: u8 = 2;
 const APPEND_ENTRIES: u8 = 3;
@@ -31,6 +31,8 @@ const PRE_VOTE: u8 = 5;
 const PRE_VOTE_REPLY: u8 = 6;
 const INSTALL_SNAPSHOT: u8 = 7;
 const INSTALL_SNAPSHOT_REPLY: u8 = 8;
+const READ_INDEX: u8 = 9;
+const READ_INDEX_REPLY: u8 = 10;
 
 /// Tags for a log entry's payload.
 const ENTRY_NOOP: u8 = 0;
@@ -112,6 +114,7 @@ fn encode(message: &Message) -> Vec<u8> {
             prev_log_term,
             entries,
             leader_commit,
+            seq,
         } => {
             out.push(APPEND_ENTRIES);
             put_u64(
@@ -121,6 +124,7 @@ fn encode(message: &Message) -> Vec<u8> {
                     *prev_log_index,
                     *prev_log_term,
                     *leader_commit,
+                    *seq,
                     entries.len() as u64,
                 ],
             );
@@ -146,11 +150,19 @@ fn encode(message: &Message) -> Vec<u8> {
             offset,
             data,
             done,
+            seq,
         } => {
             out.push(INSTALL_SNAPSHOT);
             put_u64(
                 &mut out,
-                &[*term, *last_index, *last_term, *offset, data.len() as u64],
+                &[
+                    *term,
+                    *last_index,
+                    *last_term,
+                    *offset,
+                    *seq,
+                    data.len() as u64,
+                ],
             );
             out.extend_from_slice(data);
             out.push(u8::from(*done));
@@ -160,9 +172,10 @@ fn encode(message: &Message) -> Vec<u8> {
             last_index,
             next_offset,
             done,
+            seq,
         } => {
             out.push(INSTALL_SNAPSHOT_REPLY);
-            put_u64(&mut out, &[*term, *last_index, *next_offset]);
+            put_u64(&mut out, &[*term, *last_index, *next_offset, *seq]);
             out.push(u8::from(*done));
         }
         Message::AppendEntriesReply {
@@ -171,9 +184,10 @@ fn encode(message: &Message) -> Vec<u8> {
             match_index,
             conflict_index,
             conflict_term,
+            seq,
         } => {
             out.push(APPEND_ENTRIES_REPLY);
-            put_u64(&mut out, &[*term, *match_index, *conflict_index]);
+            put_u64(&mut out, &[*term, *match_index, *conflict_index, *seq]);
             out.push(u8::from(*success));
             match conflict_term {
                 Some(t) => {
@@ -185,6 +199,16 @@ fn encode(message: &Message) -> Vec<u8> {
                     put_u64(&mut out, &[0]);
                 }
             }
+        }
+        Message::ReadIndex { term, id } => {
+            out.push(READ_INDEX);
+            put_u64(&mut out, &[*term, *id]);
+        }
+        Message::ReadIndexReply { term, id, index } => {
+            out.push(READ_INDEX_REPLY);
+            put_u64(&mut out, &[*term, *id]);
+            out.push(u8::from(index.is_some()));
+            put_u64(&mut out, &[index.unwrap_or(0)]);
         }
     }
     out
@@ -217,6 +241,7 @@ fn decode(body: &[u8]) -> Option<Message> {
             let prev_log_index = r.u64()?;
             let prev_log_term = r.u64()?;
             let leader_commit = r.u64()?;
+            let seq = r.u64()?;
             let count = r.u64()?;
             // Guard against a count that would allocate the world before a
             // single entry has been read.
@@ -246,6 +271,7 @@ fn decode(body: &[u8]) -> Option<Message> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                seq,
             }
         }
         INSTALL_SNAPSHOT => {
@@ -253,6 +279,7 @@ fn decode(body: &[u8]) -> Option<Message> {
             let last_index = r.u64()?;
             let last_term = r.u64()?;
             let offset = r.u64()?;
+            let seq = r.u64()?;
             let len = r.u64()?;
             let data = r.bytes(len)?.to_vec();
             Message::InstallSnapshot {
@@ -262,18 +289,21 @@ fn decode(body: &[u8]) -> Option<Message> {
                 offset,
                 data,
                 done: r.bool()?,
+                seq,
             }
         }
         INSTALL_SNAPSHOT_REPLY => Message::InstallSnapshotReply {
             term: r.u64()?,
             last_index: r.u64()?,
             next_offset: r.u64()?,
+            seq: r.u64()?,
             done: r.bool()?,
         },
         APPEND_ENTRIES_REPLY => {
             let term = r.u64()?;
             let match_index = r.u64()?;
             let conflict_index = r.u64()?;
+            let seq = r.u64()?;
             let success = r.bool()?;
             let has_term = r.bool()?;
             let conflict = r.u64()?;
@@ -283,6 +313,22 @@ fn decode(body: &[u8]) -> Option<Message> {
                 match_index,
                 conflict_index,
                 conflict_term: has_term.then_some(conflict),
+                seq,
+            }
+        }
+        READ_INDEX => Message::ReadIndex {
+            term: r.u64()?,
+            id: r.u64()?,
+        },
+        READ_INDEX_REPLY => {
+            let term = r.u64()?;
+            let id = r.u64()?;
+            let has_index = r.bool()?;
+            let index = r.u64()?;
+            Message::ReadIndexReply {
+                term,
+                id,
+                index: has_index.then_some(index),
             }
         }
         _ => return None,
@@ -353,6 +399,7 @@ mod tests {
             offset: 1 << 20,
             data: b"\r\n\0binary snapshot bytes\xff".to_vec(),
             done: false,
+            seq: 41,
         });
         round_trip(Message::InstallSnapshot {
             term: 4,
@@ -361,18 +408,41 @@ mod tests {
             offset: 0,
             data: Vec::new(),
             done: true,
+            seq: 0,
         });
         round_trip(Message::InstallSnapshotReply {
             term: 4,
             last_index: 900,
             next_offset: 12345,
             done: false,
+            seq: 41,
         });
         round_trip(Message::InstallSnapshotReply {
             term: 4,
             last_index: 900,
             next_offset: 0,
             done: true,
+            seq: 7,
+        });
+    }
+
+    #[test]
+    fn read_index_messages_round_trip() {
+        round_trip(Message::ReadIndex { term: 3, id: 99 });
+        round_trip(Message::ReadIndexReply {
+            term: 3,
+            id: 99,
+            index: Some(1234),
+        });
+        round_trip(Message::ReadIndexReply {
+            term: 3,
+            id: 99,
+            index: None,
+        });
+        round_trip(Message::ReadIndexReply {
+            term: 3,
+            id: 99,
+            index: Some(0),
         });
     }
 
@@ -410,6 +480,7 @@ mod tests {
             prev_log_term: 0,
             entries: Vec::new(),
             leader_commit: 0,
+            seq: 0,
         });
         round_trip(Message::AppendEntries {
             term: 5,
@@ -433,6 +504,7 @@ mod tests {
                 },
             ],
             leader_commit: 3,
+            seq: u64::MAX,
         });
         round_trip(Message::AppendEntriesReply {
             term: 5,
@@ -440,6 +512,7 @@ mod tests {
             match_index: 4,
             conflict_index: 0,
             conflict_term: None,
+            seq: 12,
         });
         round_trip(Message::AppendEntriesReply {
             term: 5,
@@ -447,6 +520,7 @@ mod tests {
             match_index: 0,
             conflict_index: 2,
             conflict_term: Some(3),
+            seq: 12,
         });
     }
 
@@ -488,6 +562,7 @@ mod tests {
                     command: Command::Data(b"value".to_vec()),
                 }],
                 leader_commit: 0,
+                seq: 1,
             },
         )
         .unwrap();

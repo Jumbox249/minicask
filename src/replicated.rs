@@ -32,7 +32,8 @@
 use crate::crc::crc32_parts;
 use crate::error::{Error, Result};
 use crate::raft::{
-    Accepted, Action, Command, Message, Node, NodeId, ProposeError, Role, SnapshotSink, Storage,
+    Accepted, Action, Command, Message, Node, NodeId, ProposeError, ReadRequest, ReadState, Role,
+    SnapshotSink, Storage,
 };
 use crate::record::{self, Header, HEADER_LEN};
 use crate::store::{Store, StoreView};
@@ -109,11 +110,13 @@ impl Op {
 /// One node of a replicated store: a consensus node and the store it
 /// drives.
 ///
-/// Reads are served from the local store and are not put through the log,
-/// which makes them fast and leaves one caveat worth stating: a leader that
-/// has been deposed without hearing about it yet can answer a read with a
-/// value that is one write out of date. Closing that needs a read barrier,
-/// which is on the list rather than in the code.
+/// Reads are served from the local store and never go through the log.
+/// [`get`](Self::get) reads whatever this node has applied, which on a
+/// follower, or on a leader deposed without knowing it yet, can be behind
+/// the cluster. For a read that sees every acknowledged write, take a
+/// [`read_index`](Self::read_index) first and read once
+/// [`read_state`](Self::read_state) says it is ready and the store has
+/// applied that far.
 pub struct ReplicatedStore<S: Storage> {
     node: Node<S>,
     store: Store,
@@ -331,6 +334,29 @@ impl<S: Storage> ReplicatedStore<S> {
 
     pub fn delete(&mut self, key: &[u8]) -> std::result::Result<Accepted, ProposeError> {
         self.propose(&Op::Delete { key: key.to_vec() })
+    }
+
+    /// Start a read that sees every write acknowledged before it. See
+    /// [`Node::read_index`].
+    pub fn read_index(&mut self) -> (ReadRequest, Vec<Action>) {
+        self.node.read_index()
+    }
+
+    /// Where a read stands, from the store's side. [`ReadState::Ready`]
+    /// means it can be answered from this store now: the node has confirmed
+    /// it, and the store has applied as far as the read has to see. A
+    /// follower often has the leader's answer before it has applied that
+    /// far, and answering then would miss the very writes the read index
+    /// exists to include.
+    pub fn read_state(&self, request: &ReadRequest) -> ReadState {
+        match self.node.read_state(request) {
+            ReadState::Ready(index) if self.applied < index => ReadState::Pending,
+            other => other,
+        }
+    }
+
+    pub fn forget_read(&mut self, request: &ReadRequest) {
+        self.node.forget_read(request)
     }
 
     /// Read from the local store. See the caveat on the type.
@@ -825,6 +851,76 @@ mod tests {
         // And the store itself has carried on regardless.
         assert_eq!(replica.get(b"a").unwrap(), Some(b"overwritten".to_vec()));
         assert_eq!(replica.get(b"b").unwrap(), None);
+        drop(replica);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A follower gets the leader's answer to a read before it has applied
+    /// the writes that answer covers, whenever the answer outruns the
+    /// commit index. The read has to wait for the store, not just for the
+    /// answer.
+    #[test]
+    fn a_read_waits_for_the_store_as_well_as_the_leader() {
+        use crate::raft::{Config, Entry, MemStorage};
+        let (path, store) = temp_store("read-waits");
+        let node = Node::new(1, vec![1, 2, 3], Config::default(), MemStorage::new());
+        let mut replica = ReplicatedStore::new(node, store).unwrap();
+
+        let put = Op::Put {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        };
+        let append = |leader_commit| Message::AppendEntries {
+            term: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![
+                Entry {
+                    term: 1,
+                    index: 1,
+                    command: Command::Noop,
+                },
+                Entry {
+                    term: 1,
+                    index: 2,
+                    command: Command::Data(put.encode().unwrap()),
+                },
+            ],
+            leader_commit,
+            seq: 1,
+        };
+        // The entries arrive, but not yet the news that they committed.
+        replica.step(2, append(0)).unwrap();
+        assert_eq!(replica.applied_index(), 0);
+
+        let (read, actions) = replica.read_index();
+        let id = match actions.as_slice() {
+            [Action::Send {
+                message: Message::ReadIndex { id, .. },
+                ..
+            }] => *id,
+            other => panic!("expected the question to go to the leader: {other:?}"),
+        };
+        replica
+            .step(
+                2,
+                Message::ReadIndexReply {
+                    term: 1,
+                    id,
+                    index: Some(2),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            replica.read_state(&read),
+            ReadState::Pending,
+            "the read was allowed before the store had the write it must see"
+        );
+        assert_eq!(replica.get(b"k").unwrap(), None);
+
+        replica.step(2, append(2)).unwrap();
+        assert_eq!(replica.read_state(&read), ReadState::Ready(2));
+        assert_eq!(replica.get(b"k").unwrap(), Some(b"v".to_vec()));
         drop(replica);
         let _ = std::fs::remove_dir_all(&path);
     }

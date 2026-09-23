@@ -301,20 +301,42 @@ fn a_write_reaches_every_node_on_disk() {
 }
 
 #[test]
-fn a_follower_redirects_to_the_leader() {
+fn a_follower_redirects_writes_to_the_leader() {
     let c = Cluster::start(3);
     let leader = c.await_leader();
     let follower = c.ids().into_iter().find(|&id| id != leader).expect("one");
     let leader_addr = c.client_addr(leader).to_string();
 
     // Redis clients already know how to read `MOVED`.
-    for command in [
-        [b"SET".as_slice(), b"k", b"v"].as_slice(),
-        [b"GET".as_slice(), b"k"].as_slice(),
-    ] {
-        match c.command(follower, command) {
-            Reply::Error(e) => assert_eq!(e, format!("MOVED 0 {leader_addr}")),
-            other => panic!("expected a redirect from the follower, got {other:?}"),
+    match c.command(follower, &[b"SET", b"k", b"v"]) {
+        Reply::Error(e) => assert_eq!(e, format!("MOVED 0 {leader_addr}")),
+        other => panic!("expected a redirect from the follower, got {other:?}"),
+    }
+}
+
+/// A follower answers reads itself, and a read there sees a write the
+/// leader acknowledged a moment earlier, even though nothing told the
+/// follower to wait for it. That is the read index at work: the follower
+/// asks the leader how far a read has to see, then waits until its own
+/// store has applied that far.
+#[test]
+fn a_follower_serves_reads_that_see_every_acknowledged_write() {
+    let c = Cluster::start(3);
+    let leader = c.await_leader();
+    let followers: Vec<u64> = c.ids().into_iter().filter(|&id| id != leader).collect();
+
+    for round in 0..20 {
+        let value = format!("v{round}");
+        assert_eq!(
+            c.command(leader, &[b"SET", b"k", value.as_bytes()]),
+            Reply::ok()
+        );
+        for &id in &followers {
+            assert_eq!(
+                c.command(id, &[b"GET", b"k"]),
+                bulk(&value),
+                "node {id} served a stale read in round {round}"
+            );
         }
     }
 }

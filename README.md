@@ -183,6 +183,16 @@ Plain Raft never tells a leader it has been cut off. It keeps the title until it
 
 The second of those was found by a test that failed only when the suite ran in parallel: a `GET` for a write that had already been acknowledged came back empty, in the window between an election being won and the backlog being applied.
 
+Check quorum narrows the window in which a deposed leader answers reads, but it does not close it: until the timeout fires, the old leader still believes it leads, and the majority may already have elected someone else and accepted writes it knows nothing about. A read index closes it.
+
+### Reads that cannot be stale
+
+A read records the commit index, then waits for a majority to answer a round of heartbeats sent *after* it began. Every message a leader sends carries its current round and every reply echoes it, so a reply to an earlier message, which says nothing about the moment the read began, is not counted. If a majority answers, no other leader can have been elected in between, and a store applied up to the recorded index holds every acknowledged write. It costs one round trip and nothing in the log. A leader that has not yet committed its no-op records the no-op's index rather than its own commit index, which it does not yet know to be complete.
+
+A follower asks the leader for the index instead of recording its own, waits for its store to apply that far, and then answers the read itself. So reads are spread across the cluster rather than all landing on the leader, and a read on a follower still sees a write the leader acknowledged a moment earlier. The wait matters: the leader's answer often arrives before the follower has applied the entries it covers, and answering then would miss exactly the writes the index exists to include.
+
+One test cuts a leader off from the majority, starts a read on it straight away, lets the others elect a replacement and commit a write, and requires the read never to be confirmed; another reads from both followers straight after each of twenty writes on the leader, over TCP, and requires every read to see it.
+
 ### Asking before standing
 
 A node that has been cut off spends the partition timing out. Raising its term each time it does costs nothing while it is away and a great deal when it returns: its term now leads the cluster's, so a leader that is doing its job perfectly well has to stand down, and an election is held that the returning node was never going to win.
@@ -220,7 +230,6 @@ Taking a snapshot changes two files, and a crash can land between them. The snap
 
 - **Store compaction still holds the lock.** When a snapshot finds more than half the store is dead records it compacts the store, and that rewrites every live record while consensus waits. It happens at most once per snapshot. Restoring a snapshot also holds the lock, on a follower that is not serving anything until it is done.
 - **Fixed membership.** Adding or removing a node means restarting the cluster.
-- **Reads go to the leader**, so followers are redundancy and not read capacity.
 
 ## A replicated store
 
@@ -236,7 +245,9 @@ Clients are still `redis-cli`. A write is not acknowledged until a majority has 
 ```console
 $ redis-cli -p 6003 SET language rust
 OK
-$ redis-cli -p 6001 GET language          # a follower
+$ redis-cli -p 6001 GET language          # a follower, and it still sees the write
+"rust"
+$ redis-cli -p 6001 SET language go       # but writes go to the leader
 MOVED 0 127.0.0.1:6003
 $ redis-cli -p 6003 RAFT
 id:3
@@ -252,7 +263,7 @@ Kill node 3 and the other two elect a replacement in well under a second, with e
 
 `SET` and `DEL` become `Op::Put` and `Op::Delete`, encoded in the store's own record format, so a command on the wire is checksummed and a delete is the same tombstone the store has always understood. The consensus layer never looks inside one.
 
-Reads and writes both go to the leader. A follower's store is only as current as the last entry it applied, so answering from one would hand back a value that a later read could contradict.
+Writes go to the leader, and a follower answers one with `MOVED`, which Redis clients already know how to follow. Reads are answered wherever they arrive, through the read index above, so every node is read capacity and none of them can hand back a value a later read contradicts.
 
 ### Where the durability lives
 

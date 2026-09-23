@@ -10,7 +10,8 @@
 //! the state it had persisted.
 
 use minicask::raft::{
-    Action, Command, Config, Entry, MemStorage, Message, Node, NodeId, Role, Storage,
+    Action, Command, Config, Entry, MemStorage, Message, Node, NodeId, ReadRequest, ReadState,
+    Role, Storage,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -281,6 +282,21 @@ impl Cluster {
             _ => panic!("node {id} is not running"),
         };
         index
+    }
+
+    fn read_index(&mut self, id: NodeId) -> ReadRequest {
+        match self.slots.get_mut(&id) {
+            Some(Slot::Running(node)) => {
+                let (request, actions) = node.read_index();
+                queue(&mut self.inflight, id, actions);
+                request
+            }
+            _ => panic!("node {id} is not running"),
+        }
+    }
+
+    fn read_state(&self, id: NodeId, request: &ReadRequest) -> ReadState {
+        self.node(id).read_state(request)
     }
 
     /// The data commands a node has applied, in order, with the leaders'
@@ -1305,4 +1321,79 @@ fn a_command_too_large_to_replicate_is_refused() {
         _ => panic!("the leader is not running"),
     }
     assert_eq!(c.node(leader).last_index(), before, "nothing was appended");
+}
+
+// -- reads --------------------------------------------------------------
+
+/// The case the read index exists for. A leader cut off from the others
+/// goes on believing it leads until check-quorum catches up with it, and
+/// in the meantime the majority elects someone else and commits writes it
+/// knows nothing about. A read started on it in that window must never be
+/// confirmed, or it would be answered from a store that is already stale.
+#[test]
+fn a_leader_cut_off_from_the_majority_never_confirms_a_read() {
+    let mut c = Cluster::new(3);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let old = c.leader().expect("leader");
+    let before = c.propose(old, b"before");
+    c.run_until("the write to commit everywhere", |c| {
+        c.ids.iter().all(|&id| c.committed_on(id) >= before)
+    });
+
+    let others: Vec<NodeId> = c.ids.iter().copied().filter(|&id| id != old).collect();
+    c.partition(&[&[old], &others]);
+    let read = c.read_index(old);
+    assert!(c.node(old).is_leader(), "it has not noticed yet");
+
+    let mut replaced = false;
+    for _ in 0..500 {
+        c.tick();
+        assert_ne!(
+            c.read_state(old, &read),
+            ReadState::Ready(before),
+            "a leader with no majority confirmed a read"
+        );
+        assert!(!matches!(c.read_state(old, &read), ReadState::Ready(_)));
+        if !replaced {
+            if let Some(new) = c.leader_in_group(&others) {
+                // The write the stale leader could have missed.
+                c.propose(new, b"after");
+                replaced = true;
+            }
+        }
+        if replaced && !c.node(old).is_leader() {
+            break;
+        }
+    }
+    assert!(replaced, "the majority never elected a new leader");
+    assert!(!c.node(old).is_leader(), "check-quorum never stood it down");
+    assert_eq!(c.read_state(old, &read), ReadState::Failed);
+}
+
+/// A read on a follower is confirmed by the leader, and its index covers a
+/// write the leader acknowledged before the read began, whatever the
+/// follower itself has heard about that write.
+#[test]
+fn a_follower_read_covers_every_write_acknowledged_before_it() {
+    let mut c = Cluster::new(3);
+    c.run_until("a leader", |c| c.leader().is_some());
+    let leader = c.leader().expect("leader");
+    let follower = c.ids.iter().copied().find(|&id| id != leader).expect("one");
+
+    for round in 0..10u8 {
+        let index = c.propose(leader, &[b'w', round]);
+        c.run_until("the leader to commit", |c| c.committed_on(leader) >= index);
+
+        let read = c.read_index(follower);
+        c.run_until("the read to be answered", |c| {
+            c.read_state(follower, &read) != ReadState::Pending
+        });
+        match c.read_state(follower, &read) {
+            ReadState::Ready(at) => assert!(
+                at >= index,
+                "round {round}: a read after write {index} was told to wait only for {at}"
+            ),
+            other => panic!("round {round}: the read was not confirmed: {other:?}"),
+        }
+    }
 }

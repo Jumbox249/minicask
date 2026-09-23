@@ -121,6 +121,53 @@ impl From<crate::Error> for ProposeError {
     }
 }
 
+/// A read that has been started with [`Node::read_index`] and is waiting to
+/// be allowed. Opaque; ask [`Node::read_state`] about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadRequest(ReadKind);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadKind {
+    /// Taken on the leader, and allowed once a majority has answered round
+    /// `seq` of `term`.
+    Local { term: u64, seq: u64, index: u64 },
+    /// Asked of `leader`, whose answer arrives as a message.
+    Forwarded { id: u64, leader: NodeId },
+    /// There was nobody to ask.
+    Refused,
+}
+
+/// Where a read stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadState {
+    /// Not confirmed yet.
+    Pending,
+    /// Confirmed. The read may be answered from the state machine once it
+    /// has applied at least this index, and will then see every write that
+    /// was acknowledged before the read began.
+    Ready(u64),
+    /// It never will be: leadership changed, or there was no leader to
+    /// ask. Try again, probably somewhere else.
+    Failed,
+}
+
+/// What a follower has heard back about a read it forwarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Waiting,
+    Ready(u64),
+    Refused,
+}
+
+/// A read a follower asked this leader for, waiting on a round.
+#[derive(Debug, Clone, Copy)]
+struct RemoteRead {
+    from: NodeId,
+    id: u64,
+    seq: u64,
+    index: u64,
+}
+
 /// A deterministic xorshift, so that randomised election timeouts are
 /// reproducible. Seeded from the node id, which is enough for peers to
 /// time out at different moments.
@@ -183,6 +230,18 @@ pub struct Node<S: Storage> {
     next_index: HashMap<NodeId, u64>,
     match_index: HashMap<NodeId, u64>,
 
+    /// Leader only: the current round. Every `AppendEntries` and
+    /// `InstallSnapshot` carries it and every reply echoes it, and a read
+    /// opens a new one. Kept across terms, so it never repeats.
+    seq: u64,
+    /// Leader only: the latest round each follower has answered this term.
+    acked: HashMap<NodeId, u64>,
+    /// Leader only: reads followers have asked for, waiting on a round.
+    remote_reads: Vec<RemoteRead>,
+    /// Follower only: reads forwarded to a leader, by id, and the answers.
+    forwarded: HashMap<u64, Answer>,
+    next_read: u64,
+
     election_elapsed: u64,
     heartbeat_elapsed: u64,
     election_timeout: u64,
@@ -218,6 +277,11 @@ impl<S: Storage> Node<S> {
             incoming: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
+            seq: 0,
+            acked: HashMap::new(),
+            remote_reads: Vec::new(),
+            forwarded: HashMap::new(),
+            next_read: 0,
             election_elapsed: 0,
             heartbeat_elapsed: 0,
             election_timeout,
@@ -262,6 +326,85 @@ impl<S: Storage> Node<S> {
     /// everything earlier commits along with it.
     pub fn ready_to_serve(&self) -> bool {
         self.role == Role::Leader && self.commit_index >= self.leader_start
+    }
+
+    /// Start a read that must see every write acknowledged before it.
+    ///
+    /// A read served straight from the leader's state machine is fast and
+    /// usually right, but not always: a leader cut off from the others
+    /// goes on believing it leads until it notices, and in the meantime a
+    /// new leader can accept writes it knows nothing about. So a read
+    /// first records the commit index, then waits for a majority to answer
+    /// a round of heartbeats sent after that. If they do, no other leader
+    /// can have been elected in between, and a state machine applied up to
+    /// the recorded index holds every acknowledged write. That is the read
+    /// index from section 6.4 of the Raft dissertation, and it costs one
+    /// round trip and nothing in the log.
+    ///
+    /// On a follower the question goes to the leader instead, and once
+    /// the answer comes back the follower serves the read from its own
+    /// state machine, which is how reads get spread across a cluster
+    /// rather than all landing on the leader.
+    ///
+    /// Poll [`read_state`](Node::read_state) after each `tick` or `step`,
+    /// and hand the request to [`forget_read`](Node::forget_read) when done
+    /// with it.
+    pub fn read_index(&mut self) -> (ReadRequest, Vec<Action>) {
+        let mut actions = Vec::new();
+        let request = if self.role == Role::Leader {
+            let (seq, index) = self.open_read_round(&mut actions);
+            ReadKind::Local {
+                term: self.term(),
+                seq,
+                index,
+            }
+        } else if let Some(leader) = self.leader_id {
+            self.next_read += 1;
+            let id = self.next_read;
+            self.forwarded.insert(id, Answer::Waiting);
+            actions.push(Action::Send {
+                to: leader,
+                message: Message::ReadIndex {
+                    term: self.term(),
+                    id,
+                },
+            });
+            ReadKind::Forwarded { id, leader }
+        } else {
+            ReadKind::Refused
+        };
+        (ReadRequest(request), actions)
+    }
+
+    pub fn read_state(&self, request: &ReadRequest) -> ReadState {
+        match request.0 {
+            ReadKind::Local { term, seq, index } => {
+                if self.role != Role::Leader || self.term() != term {
+                    // Whatever the round says now, it says it about a term
+                    // this node no longer leads.
+                    ReadState::Failed
+                } else if self.round_confirmed(seq) {
+                    ReadState::Ready(index)
+                } else {
+                    ReadState::Pending
+                }
+            }
+            ReadKind::Forwarded { id, leader } => match self.forwarded.get(&id) {
+                Some(Answer::Ready(index)) => ReadState::Ready(*index),
+                // The question went to a leader this node has since stopped
+                // following, so an answer may never come.
+                Some(Answer::Waiting) if self.leader_id == Some(leader) => ReadState::Pending,
+                _ => ReadState::Failed,
+            },
+            ReadKind::Refused => ReadState::Failed,
+        }
+    }
+
+    /// Let go of a read, answered or not.
+    pub fn forget_read(&mut self, request: &ReadRequest) {
+        if let ReadKind::Forwarded { id, .. } = request.0 {
+            self.forwarded.remove(&id);
+        }
     }
 
     pub fn last_index(&self) -> u64 {
@@ -475,6 +618,7 @@ impl<S: Storage> Node<S> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                seq,
                 ..
             } => self.handle_append_entries(
                 from,
@@ -482,6 +626,7 @@ impl<S: Storage> Node<S> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                seq,
                 &mut actions,
             )?,
             Message::AppendEntriesReply {
@@ -490,21 +635,26 @@ impl<S: Storage> Node<S> {
                 match_index,
                 conflict_index,
                 conflict_term,
-            } => self.handle_append_reply(
-                from,
-                term,
-                success,
-                match_index,
-                conflict_index,
-                conflict_term,
-                &mut actions,
-            )?,
+                seq,
+            } => {
+                if self.heard_round(from, term, seq, &mut actions) {
+                    self.handle_append_reply(
+                        from,
+                        success,
+                        match_index,
+                        conflict_index,
+                        conflict_term,
+                        &mut actions,
+                    )?
+                }
+            }
             Message::InstallSnapshot {
                 last_index,
                 last_term,
                 offset,
                 data,
                 done,
+                seq,
                 ..
             } => self.handle_install_snapshot(
                 from,
@@ -515,6 +665,7 @@ impl<S: Storage> Node<S> {
                 offset,
                 data,
                 done,
+                seq,
                 &mut actions,
             )?,
             Message::InstallSnapshotReply {
@@ -522,8 +673,21 @@ impl<S: Storage> Node<S> {
                 last_index,
                 next_offset,
                 done,
+                seq,
             } => {
-                self.handle_snapshot_reply(from, term, last_index, next_offset, done, &mut actions)?
+                if self.heard_round(from, term, seq, &mut actions) {
+                    self.handle_snapshot_reply(from, last_index, next_offset, done, &mut actions)?
+                }
+            }
+            Message::ReadIndex { id, .. } => self.handle_read_index(from, id, &mut actions),
+            Message::ReadIndexReply { id, index, .. } => {
+                // An answer from an earlier term is still a good one: that
+                // leader confirmed it held office after the question
+                // arrived, so the index covers every write acknowledged
+                // before it was asked.
+                if let Some(answer @ Answer::Waiting) = self.forwarded.get_mut(&id) {
+                    *answer = index.map_or(Answer::Refused, Answer::Ready);
+                }
             }
         }
         Ok(actions)
@@ -575,6 +739,9 @@ impl<S: Storage> Node<S> {
         self.leader_id = leader;
         self.votes.clear();
         self.active.clear();
+        // Reads asked of this node as leader go unanswered, and the
+        // followers who asked give up on them once they see it has gone.
+        self.remote_reads.clear();
         if term != previous.term {
             self.storage.save_hard_state(HardState {
                 term,
@@ -593,6 +760,7 @@ impl<S: Storage> Node<S> {
     fn become_pre_candidate(&mut self, actions: &mut Vec<Action>) -> Result<()> {
         self.role = Role::PreCandidate;
         self.leader_id = None;
+        self.remote_reads.clear();
         self.votes.clear();
         self.votes.insert(self.id);
         self.reset_election_timer();
@@ -670,6 +838,7 @@ impl<S: Storage> Node<S> {
         let term = self.term() + 1;
         self.role = Role::Candidate;
         self.leader_id = None;
+        self.remote_reads.clear();
         // A candidate votes for itself, and that vote is as durable as any
         // other: forgetting it across a restart would allow a second vote.
         self.storage.save_hard_state(HardState {
@@ -706,6 +875,8 @@ impl<S: Storage> Node<S> {
         self.election_elapsed = 0;
         self.active.clear();
         self.snapshot_progress.clear();
+        self.acked.clear();
+        self.remote_reads.clear();
 
         let next = self.storage.last_index() + 1;
         self.next_index.clear();
@@ -791,6 +962,7 @@ impl<S: Storage> Node<S> {
         prev_log_term: u64,
         entries: Vec<Entry>,
         leader_commit: u64,
+        seq: u64,
         actions: &mut Vec<Action>,
     ) -> Result<()> {
         // The term was checked in `step`, so this leader is current. A
@@ -818,6 +990,7 @@ impl<S: Storage> Node<S> {
                         match_index: snapshot.index,
                         conflict_index: 0,
                         conflict_term: None,
+                        seq,
                     },
                 });
                 return Ok(());
@@ -847,6 +1020,7 @@ impl<S: Storage> Node<S> {
                     match_index: 0,
                     conflict_index,
                     conflict_term,
+                    seq,
                 },
             });
             return Ok(());
@@ -888,29 +1062,45 @@ impl<S: Storage> Node<S> {
                 match_index: last_covered,
                 conflict_index: 0,
                 conflict_term: None,
+                seq,
             },
         });
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn handle_append_reply(
+    /// A reply from a follower, of either kind, in this leader's term. It
+    /// proves the follower is reachable and still accepts this leader,
+    /// which is what the quorum check counts, and it answers a round, which
+    /// may be what a read is waiting on. Returns false for a reply that
+    /// belongs to another term or reached a node no longer leading.
+    fn heard_round(
         &mut self,
         from: NodeId,
         term: u64,
+        seq: u64,
+        actions: &mut Vec<Action>,
+    ) -> bool {
+        if self.role != Role::Leader || term != self.term() {
+            return false;
+        }
+        self.active.insert(from);
+        let acked = self.acked.entry(from).or_insert(0);
+        if seq > *acked {
+            *acked = seq;
+            self.release_reads(actions);
+        }
+        true
+    }
+
+    fn handle_append_reply(
+        &mut self,
+        from: NodeId,
         success: bool,
         match_index: u64,
         conflict_index: u64,
         conflict_term: Option<u64>,
         actions: &mut Vec<Action>,
     ) -> Result<()> {
-        if self.role != Role::Leader || term != self.term() {
-            return Ok(());
-        }
-        // A reply of either kind proves this peer is reachable and still
-        // accepts us, which is what the quorum check counts.
-        self.active.insert(from);
-
         if success {
             // Replies can arrive out of order, so never move a follower's
             // progress backwards.
@@ -1008,6 +1198,7 @@ impl<S: Storage> Node<S> {
                     offset,
                     data,
                     done,
+                    seq: self.seq,
                 },
             });
         }
@@ -1025,12 +1216,112 @@ impl<S: Storage> Node<S> {
                     .storage
                     .entries_within(next, self.config.max_append_bytes),
                 leader_commit: self.commit_index,
+                seq: self.seq,
             },
         })
     }
 
+    // -- reads ----------------------------------------------------------
+
+    /// Record a read and start the round that will confirm it. Returns the
+    /// round and the index the read must wait for.
+    ///
+    /// The index is the commit index, except on a leader that has not yet
+    /// committed its no-op. Such a leader holds every entry committed
+    /// before it, by the election rule, but does not yet know which of its
+    /// entries those are; the no-op's own index is a safe bound, because
+    /// everything committed before this term sits below it.
+    fn open_read_round(&mut self, actions: &mut Vec<Action>) -> (u64, u64) {
+        self.seq += 1;
+        let index = self.commit_index.max(self.leader_start);
+        let snapshot = self.storage.snapshot_meta().index;
+        let peers = self.peers.clone();
+        for peer in peers {
+            let next = self
+                .next_index
+                .get(&peer)
+                .copied()
+                .unwrap_or_else(|| self.storage.last_index() + 1);
+            // A follower being sent the snapshot answers the round with its
+            // next reply, since the piece that prompts it carries it.
+            if next <= snapshot {
+                continue;
+            }
+            // A heartbeat with nothing in it: the round is the point, and
+            // the entries go out as they always do.
+            let prev_log_index = next - 1;
+            actions.push(Action::Send {
+                to: peer,
+                message: Message::AppendEntries {
+                    term: self.term(),
+                    prev_log_index,
+                    prev_log_term: self.storage.term_at(prev_log_index).unwrap_or(0),
+                    entries: Vec::new(),
+                    leader_commit: self.commit_index,
+                    seq: self.seq,
+                },
+            });
+        }
+        (self.seq, index)
+    }
+
+    /// Whether a majority, counting this node, has answered `seq` or later.
+    fn round_confirmed(&self, seq: u64) -> bool {
+        let answered = self
+            .peers
+            .iter()
+            .filter(|p| self.acked.get(p).is_some_and(|&a| a >= seq))
+            .count();
+        self.has_majority(answered + 1)
+    }
+
+    fn handle_read_index(&mut self, from: NodeId, id: u64, actions: &mut Vec<Action>) {
+        if self.role != Role::Leader {
+            actions.push(Action::Send {
+                to: from,
+                message: Message::ReadIndexReply {
+                    term: self.term(),
+                    id,
+                    index: None,
+                },
+            });
+            return;
+        }
+        let (seq, index) = self.open_read_round(actions);
+        self.remote_reads.push(RemoteRead {
+            from,
+            id,
+            seq,
+            index,
+        });
+    }
+
+    /// Answer every follower whose read's round a majority has now seen.
+    fn release_reads(&mut self, actions: &mut Vec<Action>) {
+        if self.remote_reads.is_empty() {
+            return;
+        }
+        let term = self.term();
+        let waiting = std::mem::take(&mut self.remote_reads);
+        for read in waiting {
+            if self.round_confirmed(read.seq) {
+                actions.push(Action::Send {
+                    to: read.from,
+                    message: Message::ReadIndexReply {
+                        term,
+                        id: read.id,
+                        index: Some(read.index),
+                    },
+                });
+            } else {
+                self.remote_reads.push(read);
+            }
+        }
+    }
+
     // -- snapshots ------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_install_snapshot(
         &mut self,
         from: NodeId,
@@ -1038,6 +1329,7 @@ impl<S: Storage> Node<S> {
         offset: u64,
         data: Vec<u8>,
         done: bool,
+        seq: u64,
         actions: &mut Vec<Action>,
     ) -> Result<()> {
         // As with `AppendEntries`: the term was checked in `step`, so this
@@ -1054,6 +1346,7 @@ impl<S: Storage> Node<S> {
                 last_index: meta.index,
                 next_offset,
                 done,
+                seq,
             },
         };
 
@@ -1109,16 +1402,11 @@ impl<S: Storage> Node<S> {
     fn handle_snapshot_reply(
         &mut self,
         from: NodeId,
-        term: u64,
         last_index: u64,
         next_offset: u64,
         done: bool,
         actions: &mut Vec<Action>,
     ) -> Result<()> {
-        if self.role != Role::Leader || term != self.term() {
-            return Ok(());
-        }
-        self.active.insert(from);
         let current = self.storage.snapshot_meta().index;
 
         if done {
@@ -1198,6 +1486,12 @@ impl<S: Storage> Node<S> {
                     last_index: *last_index,
                     next_offset: 0,
                     done: false,
+                    seq: 0,
+                },
+                Message::ReadIndex { id, .. } => Message::ReadIndexReply {
+                    term,
+                    id: *id,
+                    index: None,
                 },
                 _ => Message::AppendEntriesReply {
                     term,
@@ -1205,6 +1499,7 @@ impl<S: Storage> Node<S> {
                     match_index: 0,
                     conflict_index: 0,
                     conflict_term: None,
+                    seq: 0,
                 },
             },
         }
@@ -1319,6 +1614,7 @@ mod tests {
             prev_log_term: prev.1,
             entries: entries(new),
             leader_commit: commit,
+            seq: 0,
         }
     }
 
@@ -1828,6 +2124,7 @@ mod tests {
             offset,
             data: data.to_vec(),
             done,
+            seq: 0,
         }
     }
 
@@ -2027,6 +2324,195 @@ mod tests {
         assert_eq!(node.storage().first_index(), 3);
     }
 
+    // -- reads ----------------------------------------------------------
+
+    fn ack(term: u64, seq: u64) -> Message {
+        Message::AppendEntriesReply {
+            term,
+            success: true,
+            match_index: 0,
+            conflict_index: 0,
+            conflict_term: None,
+            seq,
+        }
+    }
+
+    fn read_reply(actions: &[Action]) -> Option<(NodeId, u64, Option<u64>)> {
+        actions.iter().find_map(|a| match a {
+            Action::Send {
+                to,
+                message: Message::ReadIndexReply { id, index, .. },
+            } => Some((*to, *id, *index)),
+            _ => None,
+        })
+    }
+
+    /// The whole of the read index rests on this. A reply proves the
+    /// follower still recognised this leader when it sent it, so only a
+    /// reply to a message sent after the read began says anything about
+    /// the moment the read began.
+    #[test]
+    fn a_read_is_confirmed_only_by_answers_to_a_later_round() {
+        let mut node = follower(2, &[(1, 2)]);
+        node.leader_with(&[(2, 1), (3, 1)]);
+        node.commit_index = 1;
+
+        let (first, _) = node.read_index();
+        let (second, actions) = node.read_index();
+        let heartbeats = actions
+            .iter()
+            .filter(|a| matches!(a, Action::Send { message: Message::AppendEntries { entries, .. }, .. } if entries.is_empty()))
+            .count();
+        assert_eq!(heartbeats, 2, "a read sends a heartbeat to every follower");
+        assert_eq!(node.read_state(&second), ReadState::Pending);
+
+        // Both followers answer the first read's round.
+        node.step(2, ack(2, 1)).unwrap();
+        node.step(3, ack(2, 1)).unwrap();
+        assert_eq!(node.read_state(&first), ReadState::Ready(1));
+        assert_eq!(
+            node.read_state(&second),
+            ReadState::Pending,
+            "answers to an earlier round confirmed a later read"
+        );
+
+        // One answer to the second round, with the leader, is a majority.
+        node.step(3, ack(2, 2)).unwrap();
+        assert_eq!(node.read_state(&second), ReadState::Ready(1));
+    }
+
+    /// A leader straight out of an election has every committed entry but
+    /// does not yet know which ones they are. Its read has to wait for its
+    /// own no-op, since everything committed before this term sits below
+    /// it; its own commit index could be well short of that.
+    #[test]
+    fn a_read_on_a_new_leader_covers_everything_before_its_term() {
+        let mut node = follower(1, &[(1, 1), (2, 1)]);
+        node.campaign().unwrap();
+        node.step(
+            2,
+            Message::RequestVoteReply {
+                term: 2,
+                granted: true,
+            },
+        )
+        .unwrap();
+        assert!(node.is_leader());
+        assert_eq!(node.commit_index(), 0, "nothing known to be committed yet");
+
+        let (read, _) = node.read_index();
+        node.step(2, ack(2, node.seq)).unwrap();
+        assert_eq!(
+            node.read_state(&read),
+            ReadState::Ready(3),
+            "the read index stopped short of the new leader's no-op"
+        );
+    }
+
+    #[test]
+    fn a_leader_that_loses_office_fails_its_reads() {
+        let mut node = follower(2, &[(1, 2)]);
+        node.leader_with(&[(2, 1), (3, 1)]);
+        let (read, _) = node.read_index();
+        node.step(3, append(3, (1, 2), &[], 1)).unwrap();
+        assert!(!node.is_leader());
+        assert_eq!(node.read_state(&read), ReadState::Failed);
+    }
+
+    /// The leader's half of a follower's read: nothing is sent back until a
+    /// round started after the question has been answered by a majority.
+    #[test]
+    fn a_follower_is_answered_once_its_round_is_confirmed() {
+        let mut node = follower(2, &[(1, 2)]);
+        node.leader_with(&[(2, 1), (3, 1)]);
+        node.commit_index = 1;
+        // An earlier round, before the question.
+        let (_, _) = node.read_index();
+
+        let actions = node
+            .step(2, Message::ReadIndex { term: 2, id: 41 })
+            .unwrap();
+        assert_eq!(read_reply(&actions), None, "answered before confirming");
+        let round = node.seq;
+
+        let actions = node.step(3, ack(2, round - 1)).unwrap();
+        assert_eq!(read_reply(&actions), None, "an older round confirmed it");
+        let actions = node.step(3, ack(2, round)).unwrap();
+        assert_eq!(read_reply(&actions), Some((2, 41, Some(1))));
+    }
+
+    #[test]
+    fn a_node_that_is_not_leading_refuses_a_read() {
+        let mut node = follower(2, &[(1, 2)]);
+        let actions = node.step(2, Message::ReadIndex { term: 2, id: 7 }).unwrap();
+        assert_eq!(read_reply(&actions), Some((2, 7, None)));
+    }
+
+    /// The follower's half: it asks the leader it follows, and takes the
+    /// answer when it comes.
+    #[test]
+    fn a_forwarded_read_takes_the_leaders_answer() {
+        let mut node = follower(1, &[(1, 1)]);
+        node.step(2, append(1, (1, 1), &[], 1)).unwrap();
+        assert_eq!(node.leader(), Some(2));
+
+        let (read, actions) = node.read_index();
+        let id = match actions.as_slice() {
+            [Action::Send {
+                to: 2,
+                message: Message::ReadIndex { id, .. },
+            }] => *id,
+            other => panic!("expected one question to the leader, got {other:?}"),
+        };
+        assert_eq!(node.read_state(&read), ReadState::Pending);
+        node.step(
+            2,
+            Message::ReadIndexReply {
+                term: 1,
+                id,
+                index: Some(9),
+            },
+        )
+        .unwrap();
+        assert_eq!(node.read_state(&read), ReadState::Ready(9));
+
+        // A refusal fails it, and so does the leader changing under it.
+        let (refused, actions) = node.read_index();
+        let Some(Action::Send {
+            message: Message::ReadIndex { id, .. },
+            ..
+        }) = actions.first()
+        else {
+            panic!("no question asked")
+        };
+        node.step(
+            2,
+            Message::ReadIndexReply {
+                term: 1,
+                id: *id,
+                index: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(node.read_state(&refused), ReadState::Failed);
+
+        let (orphaned, _) = node.read_index();
+        node.step(3, append(2, (1, 1), &[], 1)).unwrap();
+        assert_eq!(node.leader(), Some(3));
+        assert_eq!(node.read_state(&orphaned), ReadState::Failed);
+
+        node.forget_read(&read);
+        assert_eq!(node.read_state(&read), ReadState::Failed, "forgotten");
+    }
+
+    #[test]
+    fn a_node_with_no_leader_to_ask_fails_the_read_at_once() {
+        let mut node = follower(1, &[]);
+        let (read, actions) = node.read_index();
+        assert!(actions.is_empty());
+        assert_eq!(node.read_state(&read), ReadState::Failed);
+    }
+
     /// A snapshot is written while the node carries on, so a leader can
     /// install a newer one in the meantime. The older one must not then
     /// replace it.
@@ -2113,6 +2599,7 @@ mod tests {
                 last_index: 10,
                 next_offset: offset,
                 done,
+                seq: 0,
             };
             let actions = node.step(2, reply).unwrap();
             if done {
@@ -2179,6 +2666,7 @@ mod tests {
                     last_index: 10,
                     next_offset: 200,
                     done: false,
+                    seq: 0,
                 },
             )
             .unwrap();

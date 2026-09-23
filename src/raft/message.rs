@@ -1,4 +1,5 @@
-//! The two RPCs Raft needs, and their replies.
+//! The RPCs Raft needs, and their replies, plus the two a read barrier
+//! needs.
 //!
 //! The sender's identity is not in the message. It travels with it, as the
 //! `from` argument to [`Node::step`](super::Node::step) and the `to` field
@@ -57,6 +58,11 @@ pub enum Message {
         prev_log_term: u64,
         entries: Vec<Entry>,
         leader_commit: u64,
+        /// The leader's round, echoed in the reply. A reply that echoes a
+        /// round at least as late as a read proves the follower still
+        /// recognised this leader after the read began, which a reply to an
+        /// earlier message cannot.
+        seq: u64,
     },
     /// The state a follower needs but the leader can no longer send as
     /// entries, because it has folded them into a snapshot. Sent in pieces
@@ -71,6 +77,8 @@ pub enum Message {
         data: Vec<u8>,
         /// Whether this is the final piece.
         done: bool,
+        /// As for `AppendEntries`.
+        seq: u64,
     },
     InstallSnapshotReply {
         term: u64,
@@ -83,6 +91,8 @@ pub enum Message {
         next_offset: u64,
         /// The snapshot is installed.
         done: bool,
+        /// The round of the piece this answers.
+        seq: u64,
     },
     AppendEntriesReply {
         term: u64,
@@ -98,6 +108,23 @@ pub enum Message {
         /// On failure, the term of the entry that did not match, if the
         /// follower had one there at all.
         conflict_term: Option<u64>,
+        /// The round of the message this answers.
+        seq: u64,
+    },
+    /// A follower asking the leader for a read index: the commit index as
+    /// of a moment after this arrived, confirmed by a majority to belong to
+    /// a leader still in office. Once its own store has applied that far,
+    /// the follower can answer the read itself.
+    ReadIndex {
+        term: u64,
+        /// The follower's own number for the read, echoed in the reply.
+        id: u64,
+    },
+    /// `None` when this node cannot give one, because it is not leading.
+    ReadIndexReply {
+        term: u64,
+        id: u64,
+        index: Option<u64>,
     },
 }
 
@@ -113,7 +140,9 @@ impl Message {
             | Message::AppendEntries { term, .. }
             | Message::AppendEntriesReply { term, .. }
             | Message::InstallSnapshot { term, .. }
-            | Message::InstallSnapshotReply { term, .. } => *term,
+            | Message::InstallSnapshotReply { term, .. }
+            | Message::ReadIndex { term, .. }
+            | Message::ReadIndexReply { term, .. } => *term,
         }
     }
 
@@ -132,6 +161,7 @@ impl Message {
                 | Message::RequestVote { .. }
                 | Message::AppendEntries { .. }
                 | Message::InstallSnapshot { .. }
+                | Message::ReadIndex { .. }
         )
     }
 }

@@ -1,28 +1,33 @@
 //! A replicated node as a running process.
 //!
-//! Three things share one [`ReplicatedStore`] behind a mutex:
+//! Three things share one [`ReplicatedStore`] behind a read-write lock:
 //!
 //! - a **ticker**, which gives the consensus node its sense of time;
 //! - a **peer listener**, one thread per inbound peer connection, feeding
 //!   messages in;
 //! - a **client listener**, one thread per Redis client, turning `SET` and
-//!   `DEL` into proposals and waiting for them to commit.
+//!   `DEL` into proposals and waiting for them to commit, and serving
+//!   reads on whichever node the client is connected to.
 //!
 //! Outbound peer traffic goes through one thread and one queue per peer,
 //! which reconnects on its own. Nothing blocks the node's lock on a socket:
 //! a message is handed to a queue and forgotten, because Raft already
 //! retries anything that does not arrive.
 //!
-//! The lock is the same trade the single-node server makes. A command holds
-//! it for one append or one read, and consensus is a network round trip
-//! anyway, so the mutex is not what limits throughput here.
+//! Consensus takes the lock alone, for a tick or a message. Reads share it:
+//! once a read has been confirmed, answering it is a lookup in the local
+//! store, and any number of those run at once. Waiting is done on a
+//! separate signal rather than on the lock, so a client waiting for its
+//! write to commit holds nothing while it waits.
 //!
 //! The one long job, writing a snapshot, happens off the lock: the ticker
 //! starts it, a thread of its own writes it from a point-in-time view of
 //! the store, and the lock is only taken again to install the result.
 
 use crate::error::Result;
-use crate::raft::{wire, Action, Config, DiskStorage, Message, Node, NodeId, ProposeError, Role};
+use crate::raft::{
+    wire, Action, Config, DiskStorage, Message, Node, NodeId, ProposeError, ReadState, Role,
+};
 use crate::replicated::ReplicatedStore;
 use crate::resp::{self, Reply};
 use crate::store::Store;
@@ -31,7 +36,7 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,11 +81,13 @@ impl ClusterConfig {
     }
 }
 
-/// The shared node, plus the signal that something was applied.
+/// The shared node, plus the signal that something changed.
 struct Shared {
-    replica: Mutex<Replica>,
-    /// Woken whenever the applied index or the role changes, so a client
-    /// waiting on a write does not have to poll.
+    replica: RwLock<Replica>,
+    /// Counts changes to the replica. Bumped, and `progress` woken, after
+    /// every tick and message, so a client waiting on a write or a read
+    /// does not have to poll, and does not hold the replica while it waits.
+    changes: Mutex<u64>,
     progress: Condvar,
     /// One queue per peer. The mutex is not for contention, which there
     /// is none of: a `Sender` is `Send` but was not `Sync` until Rust
@@ -91,10 +98,50 @@ struct Shared {
 }
 
 impl Shared {
-    fn lock(&self) -> MutexGuard<'_, Replica> {
-        // A panicking command leaves the store's own invariants intact, so
-        // there is no reason to take the rest of the cluster down with it.
-        self.replica.lock().unwrap_or_else(|e| e.into_inner())
+    // A panicking command leaves the store's own invariants intact, so
+    // there is no reason to take the rest of the cluster down with it.
+    fn lock(&self) -> RwLockWriteGuard<'_, Replica> {
+        self.replica.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, Replica> {
+        self.replica.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Say that the replica has changed, to anyone waiting on it.
+    fn changed(&self) {
+        let mut changes = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+        *changes += 1;
+        self.progress.notify_all();
+    }
+
+    /// Wait until `check` has an answer, or `deadline` passes.
+    ///
+    /// `check` runs under the shared lock, so several waiters check at
+    /// once. The change count is read before checking and compared after,
+    /// which is what makes this free of lost wakeups: a change made after
+    /// the check bumps the count, and the wait sees it and checks again
+    /// instead of sleeping through it.
+    fn wait_for<T>(
+        &self,
+        deadline: Instant,
+        mut check: impl FnMut(&Replica) -> Option<T>,
+    ) -> Option<T> {
+        loop {
+            let seen = *self.changes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(answer) = check(&self.read()) {
+                return Some(answer);
+            }
+            let mut changes = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+            while *changes == seen {
+                let remaining = deadline.checked_duration_since(Instant::now())?;
+                changes = self
+                    .progress
+                    .wait_timeout(changes, remaining)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+        }
     }
 
     /// Hand a node's outgoing messages to the per-peer queues.
@@ -117,7 +164,7 @@ impl Shared {
                 Err(e) => storage_failed(&e),
             }
         };
-        self.progress.notify_all();
+        self.changed();
         self.dispatch(actions);
     }
 }
@@ -178,7 +225,8 @@ impl ClusterNode {
 
         Ok(ClusterNode {
             shared: Arc::new(Shared {
-                replica: Mutex::new(replica),
+                replica: RwLock::new(replica),
+                changes: Mutex::new(0),
                 progress: Condvar::new(),
                 senders,
                 client_addrs,
@@ -251,7 +299,7 @@ fn ticker(shared: &Arc<Shared>, tick: Duration) {
             };
             (actions, job)
         };
-        shared.progress.notify_all();
+        shared.changed();
         shared.dispatch(actions);
 
         if let Some(job) = job {
@@ -402,9 +450,8 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
             _ => wrong_arity(&name),
         },
 
-        // Reads and writes both go to the leader. A follower's store is
-        // only as current as the last entry it applied, so answering from
-        // one would hand back a value that a later read could contradict.
+        // Reads are answered wherever they arrive, leader or follower, and
+        // see every write acknowledged before them either way. See `read`.
         "GET" => match rest {
             [key] => read(shared, |r| match r.get(key) {
                 Ok(Some(value)) => Reply::Bulk(value),
@@ -463,7 +510,7 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
 
         // Where the cluster stands, which is the first thing anyone asks.
         "RAFT" | "INFO" => {
-            let replica = shared.lock();
+            let replica = shared.read();
             let node = replica.node();
             Reply::Bulk(
                 format!(
@@ -491,32 +538,31 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
     }
 }
 
-/// Run a read, but only on a leader that is fit to answer one.
+/// Run a read that sees every write acknowledged before it, on this node.
 ///
-/// A leader elected moments ago may still be applying what it inherited,
-/// and answering during that window can miss a write that was already
-/// acknowledged. Rather than redirect a client in a loop, wait for the
-/// node to settle; it takes one round trip.
+/// A local store is not enough on its own. A follower's is only as current
+/// as the last entry it applied, and even a leader's can be stale if the
+/// leader has been cut off and replaced without noticing yet. So the read
+/// first gets a read index, from this node if it leads and from the leader
+/// if not, which a majority has confirmed; then it waits for the local
+/// store to apply that far; then it reads. See [`Node::read_index`].
 fn read(shared: &Arc<Shared>, f: impl FnOnce(&Replica) -> Reply) -> Reply {
     let deadline = Instant::now() + COMMIT_TIMEOUT;
-    let mut replica = shared.lock();
-    loop {
-        if replica.ready_to_serve() {
-            return f(&replica);
-        }
-        if !replica.is_leader() {
-            return not_leader(shared, &replica);
-        }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Reply::Error(
-                "TIMEOUT this node leads but has not caught up enough to answer".to_string(),
-            );
-        };
-        let (guard, _) = shared
-            .progress
-            .wait_timeout(replica, remaining)
-            .unwrap_or_else(|e| e.into_inner());
-        replica = guard;
+    let (request, actions) = shared.lock().read_index();
+    shared.dispatch(actions);
+
+    let mut f = Some(f);
+    let outcome = shared.wait_for(deadline, |replica| match replica.read_state(&request) {
+        ReadState::Pending => None,
+        ReadState::Ready(_) => Some(Ok(f.take().expect("answered once")(replica))),
+        ReadState::Failed => Some(Err(not_leader(shared, replica))),
+    });
+    shared.lock().forget_read(&request);
+    match outcome {
+        Some(Ok(reply)) | Some(Err(reply)) => reply,
+        None => Reply::Error(
+            "TIMEOUT the read could not be confirmed in time; no majority answered".to_string(),
+        ),
     }
 }
 
@@ -537,30 +583,23 @@ fn write(
     shared.dispatch(actions);
 
     let deadline = Instant::now() + COMMIT_TIMEOUT;
-    let mut replica = shared.lock();
-    loop {
+    let outcome = shared.wait_for(deadline, |replica| {
         if replica.applied_index() >= index {
-            return Reply::ok();
+            return Some(Reply::ok());
         }
         // Losing the term means this proposal may never commit, and may
         // yet be overwritten. Saying so beats waiting out the clock.
         if replica.node().term() != term || !replica.is_leader() {
-            return Reply::Error(
+            return Some(Reply::Error(
                 "NOTLEADER leadership was lost before the write committed; its fate is unknown"
                     .to_string(),
-            );
+            ));
         }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Reply::Error(
-                "TIMEOUT the write did not commit in time; it may still do so".to_string(),
-            );
-        };
-        let (guard, _) = shared
-            .progress
-            .wait_timeout(replica, remaining)
-            .unwrap_or_else(|e| e.into_inner());
-        replica = guard;
-    }
+        None
+    });
+    outcome.unwrap_or_else(|| {
+        Reply::Error("TIMEOUT the write did not commit in time; it may still do so".to_string())
+    })
 }
 
 /// Redis clients know `-MOVED addr` from cluster mode, so a redirect in
