@@ -36,7 +36,8 @@ pub use cluster::{ClusterConfig, ClusterNode, Peer};
 pub use error::{Error, Result};
 pub use log::SyncPolicy;
 pub use replicated::{
-    CompactedStore, CompactionJob, Op, ReplicatedStore, SnapshotJob, DEFAULT_SNAPSHOT_EVERY,
+    CompactedStore, CompactionJob, Op, ReplicatedStore, RestoreJob, RestoredStore, SnapshotJob,
+    DEFAULT_SNAPSHOT_EVERY,
 };
 pub use server::Server;
 pub use store::{CompactReport, Location, Options, Stats, Store};

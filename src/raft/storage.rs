@@ -399,7 +399,7 @@ impl Storage for DiskStorage {
         Ok(buf)
     }
 
-    fn snapshot_reader(&self) -> Result<Box<dyn Read + '_>> {
+    fn snapshot_reader(&self) -> Result<Box<dyn Read + Send>> {
         let mut file = File::open(self.dir.join("snapshot"))?;
         file.seek(SeekFrom::Start(self.snapshot_data_at))?;
         Ok(Box::new(

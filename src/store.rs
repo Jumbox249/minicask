@@ -114,6 +114,9 @@ pub struct Store {
     scanned_at_open: u64,
     /// A background compaction is out; see [`Store::begin_compaction`].
     compacting: bool,
+    /// A restore is out; see [`Store::begin_restore`]. The store takes no
+    /// writes until it is finished, since finishing replaces everything.
+    restoring: bool,
 }
 
 impl Store {
@@ -260,6 +263,7 @@ impl Store {
             active_hints,
             scanned_at_open,
             compacting: false,
+            restoring: false,
         })
     }
 
@@ -374,6 +378,9 @@ impl Store {
     }
 
     fn put_with(&mut self, key: &[u8], value: &[u8], reach: Reach) -> Result<()> {
+        if self.restoring {
+            return Err(restore_in_progress());
+        }
         let bytes = record::encode(key, Some(value), record::now_millis())?;
         self.roll_if_needed(bytes.len() as u64)?;
         let (offset, len) = self.writer.append(&bytes, reach)?;
@@ -434,6 +441,9 @@ impl Store {
     }
 
     fn delete_with(&mut self, key: &[u8], reach: Reach) -> Result<bool> {
+        if self.restoring {
+            return Err(restore_in_progress());
+        }
         if !self.keydir.contains_key(key) {
             return Ok(false);
         }
@@ -497,7 +507,7 @@ impl Store {
     /// crash partway through leaves the old files untouched and the next
     /// startup simply ignores the incomplete merge.
     pub fn compact(&mut self) -> Result<CompactReport> {
-        if self.compacting {
+        if self.compacting || self.restoring {
             return Err(compaction_in_progress());
         }
         // The merge reads records back out of the files, so none of them
@@ -597,24 +607,11 @@ impl Store {
     /// one, so a write made meanwhile always wins over the copy the merge
     /// made of what it replaced.
     pub(crate) fn begin_compaction(&mut self) -> Result<CompactionJob> {
-        if self.compacting {
+        if self.compacting || self.restoring {
             return Err(compaction_in_progress());
         }
-        // Seal the active file exactly as a rollover would.
-        self.writer.sync()?;
-        let sealed = self.writer.file_id;
-        self.sealed_synced.insert(sealed, self.writer.synced);
-        let hints = std::mem::take(&mut self.active_hints);
-        let _ = hint::write(&self.dir, sealed, self.writer.offset, &hints);
-
-        let old_ids: Vec<u64> = self.readers.keys().copied().collect();
+        let (old_ids, merged_id) = self.seal_leaving_a_slot()?;
         let old_bytes = self.disk_bytes;
-        let merged_id = sealed + 1;
-        self.writer = LogWriter::open(&self.dir, sealed + 2)?;
-        self.readers.insert(
-            sealed + 2,
-            File::open(data_file_path(&self.dir, sealed + 2))?,
-        );
 
         let view = self.view()?;
         self.compacting = true;
@@ -674,6 +671,101 @@ impl Store {
     /// be tried. Nothing was replaced, so there is nothing to undo.
     pub(crate) fn abandon_compaction(&mut self) {
         self.compacting = false;
+    }
+
+    /// Seal the active file exactly as a rollover would, and move writing
+    /// to a new file two ids on, leaving the id between for a file written
+    /// off to the side. Returns the ids of every file before the slot, and
+    /// the slot.
+    fn seal_leaving_a_slot(&mut self) -> Result<(Vec<u64>, u64)> {
+        self.writer.sync()?;
+        let sealed = self.writer.file_id;
+        self.sealed_synced.insert(sealed, self.writer.synced);
+        let hints = std::mem::take(&mut self.active_hints);
+        let _ = hint::write(&self.dir, sealed, self.writer.offset, &hints);
+
+        let old_ids: Vec<u64> = self.readers.keys().copied().collect();
+        self.writer = LogWriter::open(&self.dir, sealed + 2)?;
+        self.readers.insert(
+            sealed + 2,
+            File::open(data_file_path(&self.dir, sealed + 2))?,
+        );
+        Ok((old_ids, sealed + 1))
+    }
+
+    /// Begin replacing the store's whole contents with new ones, written
+    /// without the store: the rest is [`RestoreJob`], then
+    /// [`finish_restore`](Store::finish_restore).
+    ///
+    /// The new contents go into a file of their own in the slot left by
+    /// sealing the active file, and finishing makes the index exactly that
+    /// file and deletes every older one. Whatever the old files held that
+    /// the new contents lack goes with them, which is what a restore needs
+    /// and cannot get by writing the new keys over the old.
+    ///
+    /// The store takes no writes while a restore is out: they would land in
+    /// the active file, after the slot, and survive being replaced.
+    ///
+    /// A crash before finishing leaves the new file beside the old ones,
+    /// and a store that opens holding both. It is up to the caller to know
+    /// that the restore did not finish, and to do it again; a replica does,
+    /// because its applied index only moves once the restore is finished.
+    pub(crate) fn begin_restore(&mut self) -> Result<RestoreJob> {
+        if self.compacting || self.restoring {
+            return Err(compaction_in_progress());
+        }
+        let (old_ids, id) = self.seal_leaving_a_slot()?;
+        let part = self.dir.join(format!("{id:010}.log.part"));
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&part)?;
+        self.restoring = true;
+        Ok(RestoreJob {
+            dir: self.dir.clone(),
+            id,
+            part: Some(part),
+            file: Some(std::io::BufWriter::with_capacity(1024 * 1024, file)),
+            offset: 0,
+            index: Vec::new(),
+            hints: Vec::new(),
+            old_ids,
+        })
+    }
+
+    /// Make the store exactly what a finished [`RestoreJob`] wrote.
+    pub(crate) fn finish_restore(&mut self, restored: RestoredFile) -> Result<()> {
+        self.restoring = false;
+        for id in &restored.old_ids {
+            self.readers.remove(id);
+            self.sealed_synced.remove(id);
+            let hint = hint::hint_path(&self.dir, *id);
+            if hint.exists() {
+                std::fs::remove_file(hint)?;
+            }
+            let path = data_file_path(&self.dir, *id);
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        self.readers.insert(
+            restored.id,
+            File::open(data_file_path(&self.dir, restored.id))?,
+        );
+        self.sealed_synced.insert(restored.id, restored.bytes);
+        self.keydir = restored.index.into_iter().collect();
+        // Nothing was written to the active file while the restore was
+        // out, so the restored file is everything there is.
+        self.live_bytes = restored.bytes;
+        self.disk_bytes = restored.bytes + self.writer.offset;
+        Ok(())
+    }
+
+    /// Give up on a restore that failed. The old contents are all still
+    /// there, and the store takes writes again.
+    pub(crate) fn abandon_restore(&mut self) {
+        self.restoring = false;
     }
 
     /// The store as it stands right now, readable without the store.
@@ -739,6 +831,97 @@ impl SyncHandle {
     pub(crate) fn sync(self) -> Result<(u64, u64)> {
         self.file.sync_data()?;
         Ok(self.point)
+    }
+}
+
+fn restore_in_progress() -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "the store is being restored and takes no writes until it is done",
+    ))
+}
+
+/// New contents for a store, being written without it. See
+/// [`Store::begin_restore`].
+pub(crate) struct RestoreJob {
+    dir: PathBuf,
+    id: u64,
+    /// `None` once renamed into place, which is how `Drop` knows.
+    part: Option<PathBuf>,
+    file: Option<std::io::BufWriter<File>>,
+    offset: u64,
+    index: Vec<(Vec<u8>, Location)>,
+    hints: Vec<HintEntry>,
+    old_ids: Vec<u64>,
+}
+
+/// What a finished [`RestoreJob`] wrote.
+pub(crate) struct RestoredFile {
+    id: u64,
+    bytes: u64,
+    index: Vec<(Vec<u8>, Location)>,
+    old_ids: Vec<u64>,
+}
+
+impl RestoreJob {
+    /// Add one key and its value.
+    pub(crate) fn push(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        // A timestamp of zero: the value is the cluster's, not this
+        // node's, and no clock here knows when it was written.
+        let bytes = record::encode(key, Some(value), 0)?;
+        let file = self.file.as_mut().expect("pushed after finishing");
+        std::io::Write::write_all(file, &bytes)?;
+        let len = bytes.len() as u32;
+        self.index.push((
+            key.to_vec(),
+            Location {
+                file_id: self.id,
+                offset: self.offset,
+                len,
+                tstamp: 0,
+            },
+        ));
+        self.hints.push(HintEntry {
+            key: key.to_vec(),
+            offset: self.offset,
+            len,
+            tstamp: 0,
+            tombstone: false,
+        });
+        self.offset += len as u64;
+        Ok(())
+    }
+
+    /// Sync the new file and rename it into its slot.
+    pub(crate) fn finish(mut self) -> Result<RestoredFile> {
+        let file = self
+            .file
+            .take()
+            .expect("finished twice")
+            .into_inner()
+            .map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        drop(file);
+        let part = self.part.take().expect("finished twice");
+        std::fs::rename(&part, data_file_path(&self.dir, self.id))?;
+        log::sync_dir(&self.dir)?;
+        let _ = hint::write(&self.dir, self.id, self.offset, &self.hints);
+        Ok(RestoredFile {
+            id: self.id,
+            bytes: self.offset,
+            index: std::mem::take(&mut self.index),
+            old_ids: std::mem::take(&mut self.old_ids),
+        })
+    }
+}
+
+impl Drop for RestoreJob {
+    /// A restore given up on takes its part file with it.
+    fn drop(&mut self) {
+        self.file.take();
+        if let Some(part) = self.part.take() {
+            let _ = std::fs::remove_file(part);
+        }
     }
 }
 
@@ -1024,6 +1207,29 @@ mod tests {
         let store = Store::open(&dir).unwrap();
         assert_eq!(contents(&store), before);
         assert_eq!(store.get(b"k05").unwrap(), Some(b"meanwhile".to_vec()));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restore replaces everything, so a write made while one is out
+    /// would be thrown away by it, or, after a crash, survive it. Either is
+    /// wrong, so the store refuses writes until the restore is done.
+    #[test]
+    fn a_store_being_restored_takes_no_writes() {
+        let dir = temp("restoring-no-writes");
+        let mut store = Store::open(&dir).unwrap();
+        store.put(b"old", b"1").unwrap();
+        let mut job = store.begin_restore().unwrap();
+        assert!(store.put(b"during", b"2").is_err());
+        assert!(store.delete(b"old").is_err());
+        job.push(b"new", b"3").unwrap();
+        store.finish_restore(job.finish().unwrap()).unwrap();
+        assert_eq!(store.get(b"old").unwrap(), None);
+        assert_eq!(store.get(b"new").unwrap(), Some(b"3".to_vec()));
+        store.put(b"after", b"4").unwrap();
+        drop(store);
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(store.len(), 2);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

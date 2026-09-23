@@ -243,8 +243,9 @@ pub trait Storage {
     /// Up to `len` bytes of the snapshot's data, starting at `offset`.
     fn read_snapshot(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
 
-    /// The whole of the snapshot's data, as a stream.
-    fn snapshot_reader(&self) -> Result<Box<dyn Read + '_>>;
+    /// The whole of the snapshot's data, as a stream that owns what it
+    /// reads from, so that it can be read on another thread.
+    fn snapshot_reader(&self) -> Result<Box<dyn Read + Send>>;
 
     /// Start writing a snapshot that covers `meta`, with the membership as
     /// of `meta.index`. Nothing changes until the sink is installed.
@@ -547,8 +548,8 @@ impl Storage for MemStorage {
         Ok(self.snapshot[start..end].to_vec())
     }
 
-    fn snapshot_reader(&self) -> Result<Box<dyn Read + '_>> {
-        Ok(Box::new(&self.snapshot[..]))
+    fn snapshot_reader(&self) -> Result<Box<dyn Read + Send>> {
+        Ok(Box::new(std::io::Cursor::new(self.snapshot.clone())))
     }
 
     fn new_snapshot(

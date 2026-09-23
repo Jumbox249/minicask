@@ -130,6 +130,41 @@ pub struct ReplicatedStore<S: Storage> {
     /// The last snapshot found the store more than half dead records, and
     /// in background mode the caller has not compacted it yet.
     compaction_due: bool,
+    /// Background mode: a restore job is out.
+    restoring: bool,
+}
+
+/// A snapshot from a leader being written into the store, without the
+/// replica. See [`ReplicatedStore::start_restore`].
+pub struct RestoreJob {
+    job: crate::store::RestoreJob,
+    reader: Box<dyn Read + Send>,
+    index: u64,
+}
+
+/// A finished [`RestoreJob`].
+pub struct RestoredStore {
+    file: crate::store::RestoredFile,
+    index: u64,
+}
+
+impl RestoreJob {
+    /// Stream the snapshot into the store's new file.
+    pub fn run(self) -> Result<RestoredStore> {
+        let RestoreJob {
+            mut job,
+            reader,
+            index,
+        } = self;
+        let mut records = SnapshotRecords::new(reader);
+        while let Some((key, value)) = records.next_record()? {
+            job.push(&key, &value)?;
+        }
+        Ok(RestoredStore {
+            file: job.finish()?,
+            index,
+        })
+    }
 }
 
 /// A compaction of the store running without the replica. See
@@ -197,6 +232,7 @@ impl<S: Storage> ReplicatedStore<S> {
             background_snapshots: false,
             snapshotting: false,
             compaction_due: false,
+            restoring: false,
         };
         if replica.snapshot_index() > replica.applied {
             replica.restore()?;
@@ -296,6 +332,49 @@ impl<S: Storage> ReplicatedStore<S> {
         self.store.abandon_compaction();
     }
 
+    /// Begin bringing the store up to a snapshot a leader sent, if one is
+    /// ahead of it. Background mode only; otherwise that happens as part of
+    /// applying.
+    ///
+    /// The snapshot is written into a new file off to the side, which then
+    /// replaces everything else in the store, so the replica's lock is
+    /// only needed to start and to finish. Until then the node goes on
+    /// taking part in consensus, but applies nothing, since nothing after
+    /// the snapshot can be applied before it, and so answers no reads.
+    pub fn start_restore(&mut self) -> Result<Option<RestoreJob>> {
+        if !self.background_snapshots || self.restoring || self.snapshot_index() <= self.applied {
+            return Ok(None);
+        }
+        let reader = self.node.storage().snapshot_reader()?;
+        let job = match self.store.begin_restore() {
+            Ok(job) => job,
+            // A compaction is out; try again once it is done.
+            Err(_) => return Ok(None),
+        };
+        self.restoring = true;
+        Ok(Some(RestoreJob {
+            job,
+            reader,
+            index: self.snapshot_index(),
+        }))
+    }
+
+    /// Install a finished restore, and let applying carry on after it.
+    pub fn finish_restore(&mut self, done: RestoredStore) -> Result<()> {
+        self.restoring = false;
+        self.store.finish_restore(done.file)?;
+        self.store.sync()?;
+        self.applied = done.index;
+        write_applied(&self.store, done.index)?;
+        self.apply()
+    }
+
+    /// Give up on a restore that failed; the next tick starts it again.
+    pub fn abandon_restore(&mut self) {
+        self.restoring = false;
+        self.store.abandon_restore();
+    }
+
     /// Give up on a job that failed, so that another can be started.
     pub fn abandon_snapshot(&mut self) {
         self.snapshotting = false;
@@ -358,6 +437,13 @@ impl<S: Storage> ReplicatedStore<S> {
     }
 
     pub fn step(&mut self, from: NodeId, message: Message) -> Result<Vec<Action>> {
+        // A restore job is reading the current snapshot's file. Installing
+        // a newer one would rename over a file that is open, which Windows
+        // refuses on some toolchains, and there is no need: ignoring a
+        // message is always safe in Raft, and the leader sends it again.
+        if self.restoring && matches!(message, Message::InstallSnapshot { .. }) {
+            return Ok(Vec::new());
+        }
         let actions = self.node.step(from, message)?;
         self.apply()?;
         Ok(actions)
@@ -457,6 +543,12 @@ impl<S: Storage> ReplicatedStore<S> {
         // there is nothing to apply them from: the store has to become the
         // snapshot before anything after it can be applied.
         if self.snapshot_index() > self.applied {
+            if self.background_snapshots {
+                // The caller runs the restore, off its lock, via
+                // `start_restore`. Nothing after the snapshot can be
+                // applied until it has.
+                return Ok(());
+            }
             self.restore()?;
         }
 
@@ -1099,6 +1191,123 @@ mod tests {
         assert_eq!(replica.get(b"e").unwrap(), Some(b"after".to_vec()));
         drop(replica);
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A follower in background mode, with a store holding keys the cluster
+    /// has since deleted, sent a snapshot by leader 2.
+    fn follower_sent_a_snapshot(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        ReplicatedStore<crate::raft::MemStorage>,
+    ) {
+        use crate::raft::{Config, MemStorage};
+        let (path, mut store) = temp_store(label);
+        store.put(b"stale", b"the cluster deleted this").unwrap();
+        store.put(b"kept", b"old value").unwrap();
+        let (source_path, mut source) = temp_store(&format!("{label}-source"));
+        source.put(b"kept", b"new value").unwrap();
+        source.put(b"fresh", b"only in the snapshot").unwrap();
+        let data = encode_snapshot(&mut source).unwrap();
+        drop(source);
+
+        let node = Node::new(1, vec![1, 2, 3], Config::default(), MemStorage::new());
+        let mut replica = ReplicatedStore::new(node, store).unwrap();
+        replica.set_background_snapshots(true);
+        replica.step(2, install_message(9, data, true)).unwrap();
+        (path, source_path, replica)
+    }
+
+    fn install_message(index: u64, data: Vec<u8>, done: bool) -> Message {
+        Message::InstallSnapshot {
+            term: 1,
+            last_index: index,
+            last_term: 1,
+            offset: 0,
+            data,
+            done,
+            seq: 0,
+            members: None,
+        }
+    }
+
+    fn sorted_contents(
+        replica: &ReplicatedStore<crate::raft::MemStorage>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut keys: Vec<Vec<u8>> = replica.store().keys().map(<[u8]>::to_vec).collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|k| {
+                let v = replica.get(&k).unwrap().unwrap();
+                (k, v)
+            })
+            .collect()
+    }
+
+    fn snapshot_contents() -> Vec<(Vec<u8>, Vec<u8>)> {
+        vec![
+            (b"fresh".to_vec(), b"only in the snapshot".to_vec()),
+            (b"kept".to_vec(), b"new value".to_vec()),
+        ]
+    }
+
+    /// In background mode the restore runs off the caller's lock, and the
+    /// store is exactly the snapshot afterwards: keys the snapshot lacks
+    /// go with the files that held them.
+    #[test]
+    fn a_background_restore_makes_the_store_exactly_the_snapshot() {
+        let (path, source, mut replica) = follower_sent_a_snapshot("bg-restore");
+        assert_eq!(replica.snapshot_index(), 9);
+        assert_eq!(replica.applied_index(), 0, "restored inline under the lock");
+
+        let job = replica.start_restore().unwrap().expect("a restore is due");
+        assert!(
+            replica.start_restore().unwrap().is_none(),
+            "two were started"
+        );
+        // While it is out, a newer snapshot is not installed over the file
+        // the job is reading, and the store takes no writes.
+        let ignored = replica
+            .step(2, install_message(12, Vec::new(), true))
+            .unwrap();
+        assert!(ignored.is_empty());
+        assert_eq!(replica.snapshot_index(), 9);
+
+        let done = job.run().unwrap();
+        replica.finish_restore(done).unwrap();
+        assert_eq!(replica.applied_index(), 9);
+        assert_eq!(sorted_contents(&replica), snapshot_contents());
+
+        let (storage, store) = replica.into_parts();
+        drop(store);
+        let node = Node::new(1, vec![1, 2, 3], crate::raft::Config::default(), storage);
+        let replica = ReplicatedStore::new(node, Store::open(&path).unwrap()).unwrap();
+        assert_eq!(sorted_contents(&replica), snapshot_contents());
+        drop(replica);
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_dir_all(&source);
+    }
+
+    /// A crash after the restored file is in place but before it replaced
+    /// the rest leaves both, and a store holding the stale keys too. The
+    /// applied index never moved, so the restore runs again on the next
+    /// start and the stale keys go.
+    #[test]
+    fn a_background_restore_cut_short_is_finished_on_restart() {
+        let (path, source, mut replica) = follower_sent_a_snapshot("bg-restore-crash");
+        let job = replica.start_restore().unwrap().expect("a restore is due");
+        let _unfinished = job.run().unwrap();
+
+        let (storage, store) = replica.into_parts();
+        drop(store);
+        let node = Node::new(1, vec![1, 2, 3], crate::raft::Config::default(), storage);
+        let replica = ReplicatedStore::new(node, Store::open(&path).unwrap()).unwrap();
+        assert_eq!(replica.applied_index(), 9);
+        assert_eq!(sorted_contents(&replica), snapshot_contents());
+        drop(replica);
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_dir_all(&source);
     }
 
     #[test]

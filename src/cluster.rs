@@ -468,13 +468,20 @@ impl ClusterNode {
 fn ticker(shared: &Arc<Shared>, tick: Duration) {
     loop {
         thread::sleep(tick);
-        let (actions, job, compaction) = {
+        let (actions, job, compaction, restore) = {
             let mut replica = shared.lock();
             let actions = match replica.tick() {
                 Ok(actions) => actions,
                 Err(e) => storage_failed(&e),
             };
             shared.follow_membership(&replica);
+            let restore = match replica.start_restore() {
+                Ok(job) => job,
+                Err(e) => {
+                    eprintln!("minicask-cluster: could not start restoring a snapshot: {e}");
+                    None
+                }
+            };
             let compaction = match replica.start_compaction() {
                 Ok(job) => job,
                 Err(e) => {
@@ -491,10 +498,20 @@ fn ticker(shared: &Arc<Shared>, tick: Duration) {
                     None
                 }
             };
-            (actions, job, compaction)
+            (actions, job, compaction, restore)
         };
         shared.changed();
         shared.dispatch(actions);
+
+        if let Some(job) = restore {
+            let worker = Arc::clone(shared);
+            let spawned = thread::Builder::new()
+                .name("restore".to_string())
+                .spawn(move || restore_store(&worker, job));
+            if spawned.is_err() {
+                shared.lock().abandon_restore();
+            }
+        }
 
         if let Some(job) = compaction {
             let worker = Arc::clone(shared);
@@ -536,6 +553,28 @@ fn write_snapshot(shared: &Shared, job: crate::replicated::SnapshotJob<crate::ra
             replica.abandon_snapshot();
         }
     }
+}
+
+/// Write a leader's snapshot into the store without the lock, then take it
+/// just long enough to make that the store.
+fn restore_store(shared: &Shared, job: crate::replicated::RestoreJob) {
+    let restored = job.run();
+    {
+        let mut replica = shared.lock();
+        match restored {
+            Ok(done) => {
+                if let Err(e) = replica.finish_restore(done) {
+                    storage_failed(&e);
+                }
+            }
+            Err(e) => {
+                eprintln!("minicask-cluster: restoring a snapshot failed: {e}");
+                replica.abandon_restore();
+            }
+        }
+    }
+    // Reads and writes waiting on the applied index can move again.
+    shared.changed();
 }
 
 /// Merge the store's files without the lock, then take it just long enough
