@@ -26,6 +26,54 @@ use std::io::{Read, Write};
 /// Which node in the cluster. Small integers, stable across restarts.
 pub type NodeId = u64;
 
+/// One member of the cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub id: NodeId,
+    /// Whatever the layer above needs in order to reach this member, its
+    /// addresses for instance. Consensus carries it and never looks inside,
+    /// so that the membership and the means of reaching it change together,
+    /// in one entry.
+    pub context: Vec<u8>,
+}
+
+/// Members as bytes: a count, then each id and its context, length first.
+pub fn encode_members(members: &[Member]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(members.len() as u32).to_le_bytes());
+    for member in members {
+        out.extend_from_slice(&member.id.to_le_bytes());
+        out.extend_from_slice(&(member.context.len() as u32).to_le_bytes());
+        out.extend_from_slice(&member.context);
+    }
+    out
+}
+
+/// The reverse of [`encode_members`], or `None` for bytes it did not
+/// write, including ones with anything left over.
+pub fn decode_members(bytes: &[u8]) -> Option<Vec<Member>> {
+    let mut at = 0usize;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let slice = bytes.get(at..at.checked_add(n)?)?;
+        at += n;
+        Some(slice)
+    };
+    let count = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+    // Each member is at least twelve bytes, so a count beyond that is a
+    // lie, and believing it would allocate for nothing.
+    if count > bytes.len() / 12 {
+        return None;
+    }
+    let mut members = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = u64::from_le_bytes(take(8)?.try_into().ok()?);
+        let len = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        let context = take(len)?.to_vec();
+        members.push(Member { id, context });
+    }
+    (at == bytes.len()).then_some(members)
+}
+
 /// What a log entry carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -40,6 +88,13 @@ pub enum Command {
     /// An opaque command for the state machine on top. The consensus layer
     /// never looks inside it.
     Data(Vec<u8>),
+    /// The cluster's membership from this entry on: every member, not a
+    /// change to the last list. A node uses the newest one in its log as
+    /// soon as it has it, committed or not, which is what makes changing
+    /// one member at a time safe. See [`Node::propose_membership`].
+    ///
+    /// [`Node::propose_membership`]: super::Node::propose_membership
+    Config(Vec<Member>),
 }
 
 /// One entry in the replicated log. The index is stored alongside the term
@@ -59,6 +114,7 @@ impl Entry {
         let payload = match &self.command {
             Command::Noop => 0,
             Command::Data(bytes) => bytes.len(),
+            Command::Config(members) => encode_members(members).len(),
         };
         ENTRY_OVERHEAD + payload
     }
@@ -142,6 +198,11 @@ pub trait Storage {
     /// What the current snapshot covers.
     fn snapshot_meta(&self) -> SnapshotMeta;
 
+    /// The membership as of the snapshot's last index, if the snapshot
+    /// records one. A snapshot written before membership could change does
+    /// not, and the node falls back to the membership it was started with.
+    fn snapshot_members(&self) -> Option<Vec<Member>>;
+
     /// The size of the current snapshot's data in bytes.
     fn snapshot_len(&self) -> u64;
 
@@ -151,9 +212,13 @@ pub trait Storage {
     /// The whole of the snapshot's data, as a stream.
     fn snapshot_reader(&self) -> Result<Box<dyn Read + '_>>;
 
-    /// Start writing a snapshot that covers `meta`. Nothing changes until
-    /// the sink is installed.
-    fn new_snapshot(&mut self, meta: SnapshotMeta) -> Result<Self::Sink>;
+    /// Start writing a snapshot that covers `meta`, with the membership as
+    /// of `meta.index`. Nothing changes until the sink is installed.
+    fn new_snapshot(
+        &mut self,
+        meta: SnapshotMeta,
+        members: Option<Vec<Member>>,
+    ) -> Result<Self::Sink>;
 
     /// Replace the snapshot with a finished one and drop the entries it
     /// covers. Must not return until durable.
@@ -172,7 +237,7 @@ pub trait Storage {
 pub trait StorageExt: Storage {
     /// Write and install a snapshot that is already in hand, all at once.
     fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<()> {
-        let mut sink = self.new_snapshot(meta)?;
+        let mut sink = self.new_snapshot(meta, None)?;
         sink.write_all(data)?;
         self.install_snapshot(sink)
     }
@@ -352,6 +417,7 @@ pub struct MemStorage {
     hard_state: HardState,
     log: EntryLog,
     snapshot: Vec<u8>,
+    snapshot_members: Option<Vec<Member>>,
 }
 
 impl MemStorage {
@@ -364,6 +430,7 @@ impl MemStorage {
 #[derive(Debug)]
 pub struct MemSnapshot {
     meta: SnapshotMeta,
+    members: Option<Vec<Member>>,
     data: Vec<u8>,
 }
 
@@ -432,6 +499,10 @@ impl Storage for MemStorage {
         self.log.base()
     }
 
+    fn snapshot_members(&self) -> Option<Vec<Member>> {
+        self.snapshot_members.clone()
+    }
+
     fn snapshot_len(&self) -> u64 {
         self.snapshot.len() as u64
     }
@@ -446,9 +517,14 @@ impl Storage for MemStorage {
         Ok(Box::new(&self.snapshot[..]))
     }
 
-    fn new_snapshot(&mut self, meta: SnapshotMeta) -> Result<MemSnapshot> {
+    fn new_snapshot(
+        &mut self,
+        meta: SnapshotMeta,
+        members: Option<Vec<Member>>,
+    ) -> Result<MemSnapshot> {
         Ok(MemSnapshot {
             meta,
+            members,
             data: Vec::new(),
         })
     }
@@ -456,6 +532,7 @@ impl Storage for MemStorage {
     fn install_snapshot(&mut self, sink: MemSnapshot) -> Result<()> {
         if self.log.compact(sink.meta) {
             self.snapshot = sink.data;
+            self.snapshot_members = sink.members;
         }
         Ok(())
     }
@@ -673,5 +750,39 @@ mod tests {
             "the snapshot's term counts"
         );
         assert_eq!(s.last_index_of_term(1), None);
+    }
+}
+
+#[cfg(test)]
+mod member_tests {
+    use super::*;
+
+    #[test]
+    fn members_round_trip() {
+        let members = vec![
+            Member {
+                id: 1,
+                context: b"127.0.0.1:7001 127.0.0.1:6001".to_vec(),
+            },
+            Member {
+                id: u64::MAX - 1,
+                context: Vec::new(),
+            },
+        ];
+        assert_eq!(decode_members(&encode_members(&members)), Some(members));
+        assert_eq!(decode_members(&encode_members(&[])), Some(Vec::new()));
+    }
+
+    #[test]
+    fn garbage_is_not_a_membership() {
+        let bytes = encode_members(&[Member {
+            id: 3,
+            context: b"x".to_vec(),
+        }]);
+        assert_eq!(decode_members(&bytes[..bytes.len() - 1]), None);
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(decode_members(&longer), None);
+        assert_eq!(decode_members(&[0xff, 0xff, 0xff, 0xff]), None);
     }
 }

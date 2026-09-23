@@ -17,7 +17,20 @@
 //! the checksum and the torn-tail handling are the same code that the
 //! single-node store has already been tested on. An entry's key is its
 //! index and term; its value is the command, with a tombstone flag
-//! standing in for the no-op that carries none.
+//! standing in for the no-op that carries none. A membership entry has one
+//! more byte on its key, saying so, and the members as its value.
+//!
+//! The snapshot file begins with a marker, then a checksum over everything
+//! after it, the index and term it covers, the membership as of that
+//! index, and the data:
+//!
+//! ```text
+//! "MCS2" | crc32 | index u64 | term u64 | members_len u32 | members | data
+//! ```
+//!
+//! A file without the marker is from before membership could change: a
+//! checksum, the index and term, and the data straight after. Both are
+//! read; only the first is written.
 //!
 //! A snapshot is never held in memory whole. One being written, whether
 //! taken here or arriving from a leader, goes into a `snapshot.part-N`
@@ -34,7 +47,10 @@
 //!
 //! [`MemStorage`]: super::MemStorage
 
-use super::log::{Command, Entry, EntryLog, HardState, SnapshotMeta, SnapshotSink, Storage};
+use super::log::{
+    decode_members, encode_members, Command, Entry, EntryLog, HardState, Member, SnapshotMeta,
+    SnapshotSink, Storage,
+};
 use crate::crc::{crc32_parts, Crc32};
 use crate::error::{Error, Result};
 use crate::record::{self, Header, HEADER_LEN};
@@ -47,9 +63,15 @@ const HARD_STATE_LEN: usize = 20;
 /// real node id of `u64::MAX` is not a thing anyone should configure.
 const NO_VOTE: u64 = u64::MAX;
 
-/// The snapshot file: a checksum over everything after it, the index and
-/// term it covers, then the data.
-const SNAPSHOT_HEADER_LEN: u64 = 4 + 8 + 8;
+/// The first four bytes of a snapshot file that records its membership.
+const SNAPSHOT_MAGIC: [u8; 4] = *b"MCS2";
+/// The header of a snapshot file from before that: a checksum, the index
+/// and term, and nothing else.
+const OLD_SNAPSHOT_HEADER_LEN: u64 = 4 + 8 + 8;
+/// `members_len` when the snapshot records no membership.
+const NO_MEMBERS: u32 = u32::MAX;
+/// The extra key byte that marks an entry as a membership entry.
+const CONFIG_ENTRY: u8 = 1;
 
 /// A node's consensus state, held on disk and cached in memory.
 ///
@@ -66,6 +88,9 @@ pub struct DiskStorage {
     offsets: Vec<u64>,
     end: u64,
     snapshot_len: u64,
+    /// Where the snapshot's data begins in its file, past the header.
+    snapshot_data_at: u64,
+    snapshot_members: Option<Vec<Member>>,
     /// Numbers the part files of snapshots being written, so that two at
     /// once, one taken here and one arriving, never share a file.
     next_part: u64,
@@ -79,7 +104,12 @@ impl DiskStorage {
         std::fs::create_dir_all(&dir)?;
 
         let hard_state = read_hard_state(&dir.join("hard-state"))?;
-        let (base, snapshot_len) = read_snapshot_header(&dir)?;
+        let SnapshotHeader {
+            meta: base,
+            members: snapshot_members,
+            data_at: snapshot_data_at,
+            data_len: snapshot_len,
+        } = read_snapshot_header(&dir)?;
         remove_stray_parts(&dir)?;
 
         let mut entries_file = OpenOptions::new()
@@ -98,6 +128,8 @@ impl DiskStorage {
             offsets,
             end,
             snapshot_len,
+            snapshot_data_at,
+            snapshot_members,
             next_part: 0,
         };
 
@@ -183,6 +215,10 @@ impl DiskStorage {
 /// for the header, whose checksum is only known once the last byte is in.
 pub struct DiskSnapshot {
     meta: SnapshotMeta,
+    members: Option<Vec<Member>>,
+    /// Everything in the header after the checksum, which the checksum
+    /// was fed first.
+    header: Vec<u8>,
     /// `None` once installed, which is how `Drop` knows to leave it be.
     file: Option<BufWriter<File>>,
     path: PathBuf,
@@ -234,22 +270,28 @@ impl DiskSnapshot {
             .expect("finished twice")
             .into_inner()
             .map_err(|e| e.into_error())?;
-        let header = snapshot_header(self.meta, self.crc);
         file.seek(SeekFrom::Start(0))?;
-        file.write_all(&header)?;
+        file.write_all(&SNAPSHOT_MAGIC)?;
+        file.write_all(&self.crc.finish().to_le_bytes())?;
+        file.write_all(&self.header)?;
         file.sync_all()?;
         Ok(std::mem::take(&mut self.path))
     }
 }
 
-/// The snapshot file's header: the checksum of everything after it, then
-/// the index and term it covers. `crc` has already seen the data, and the
-/// index and term were fed to it first.
-fn snapshot_header(meta: SnapshotMeta, crc: Crc32) -> [u8; SNAPSHOT_HEADER_LEN as usize] {
-    let mut header = [0u8; SNAPSHOT_HEADER_LEN as usize];
-    header[0..4].copy_from_slice(&crc.finish().to_le_bytes());
-    header[4..12].copy_from_slice(&meta.index.to_le_bytes());
-    header[12..20].copy_from_slice(&meta.term.to_le_bytes());
+/// The part of a snapshot's header that follows the checksum.
+fn snapshot_header(meta: SnapshotMeta, members: Option<&[Member]>) -> Vec<u8> {
+    let mut header = Vec::new();
+    header.extend_from_slice(&meta.index.to_le_bytes());
+    header.extend_from_slice(&meta.term.to_le_bytes());
+    match members {
+        Some(members) => {
+            let encoded = encode_members(members);
+            header.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            header.extend_from_slice(&encoded);
+        }
+        None => header.extend_from_slice(&NO_MEMBERS.to_le_bytes()),
+    }
     header
 }
 
@@ -337,6 +379,10 @@ impl Storage for DiskStorage {
         self.log.base()
     }
 
+    fn snapshot_members(&self) -> Option<Vec<Member>> {
+        self.snapshot_members.clone()
+    }
+
     fn snapshot_len(&self) -> u64 {
         self.snapshot_len
     }
@@ -347,7 +393,7 @@ impl Storage for DiskStorage {
         }
         let len = (len as u64).min(self.snapshot_len - offset) as usize;
         let mut file = File::open(self.dir.join("snapshot"))?;
-        file.seek(SeekFrom::Start(SNAPSHOT_HEADER_LEN + offset))?;
+        file.seek(SeekFrom::Start(self.snapshot_data_at + offset))?;
         let mut buf = vec![0u8; len];
         file.read_exact(&mut buf)?;
         Ok(buf)
@@ -355,13 +401,17 @@ impl Storage for DiskStorage {
 
     fn snapshot_reader(&self) -> Result<Box<dyn Read + '_>> {
         let mut file = File::open(self.dir.join("snapshot"))?;
-        file.seek(SeekFrom::Start(SNAPSHOT_HEADER_LEN))?;
+        file.seek(SeekFrom::Start(self.snapshot_data_at))?;
         Ok(Box::new(
             BufReader::with_capacity(64 * 1024, file).take(self.snapshot_len),
         ))
     }
 
-    fn new_snapshot(&mut self, meta: SnapshotMeta) -> Result<DiskSnapshot> {
+    fn new_snapshot(
+        &mut self,
+        meta: SnapshotMeta,
+        members: Option<Vec<Member>>,
+    ) -> Result<DiskSnapshot> {
         self.next_part += 1;
         let path = self.dir.join(format!("snapshot.part-{}", self.next_part));
         let mut file = OpenOptions::new()
@@ -369,13 +419,16 @@ impl Storage for DiskStorage {
             .create(true)
             .truncate(true)
             .open(&path)?;
-        // Room for the header, which is written last.
-        file.write_all(&[0u8; SNAPSHOT_HEADER_LEN as usize])?;
+        let header = snapshot_header(meta, members.as_deref());
+        // Room for the marker, the checksum and the header, which are
+        // written last, once the checksum is known.
+        file.write_all(&vec![0u8; 8 + header.len()])?;
         let mut crc = Crc32::new();
-        crc.update(&meta.index.to_le_bytes());
-        crc.update(&meta.term.to_le_bytes());
+        crc.update(&header);
         Ok(DiskSnapshot {
             meta,
+            members,
+            header,
             file: Some(BufWriter::with_capacity(64 * 1024, file)),
             path,
             crc,
@@ -390,6 +443,8 @@ impl Storage for DiskStorage {
             return Ok(());
         }
         let len = sink.written;
+        let data_at = 8 + sink.header.len() as u64;
+        let members = sink.members.clone();
 
         // The snapshot first, so that the moment the old entries are gone
         // there is already something durable standing in for them.
@@ -397,6 +452,8 @@ impl Storage for DiskStorage {
         std::fs::rename(&part, self.dir.join("snapshot"))?;
         crate::log::sync_dir(&self.dir)?;
         self.snapshot_len = len;
+        self.snapshot_data_at = data_at;
+        self.snapshot_members = members;
 
         // Then the log, cut down to what follows the snapshot.
         self.log.compact(meta);
@@ -436,7 +493,22 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
         // format's tombstone flag already means.
         Command::Noop => record::encode(&key, None, record::now_millis()),
         Command::Data(bytes) => record::encode(&key, Some(bytes), record::now_millis()),
+        Command::Config(members) => {
+            let mut key = key.to_vec();
+            key.push(CONFIG_ENTRY);
+            record::encode(&key, Some(&encode_members(members)), record::now_millis())
+        }
     }
+}
+
+/// What a snapshot file's header says.
+#[derive(Debug, Default)]
+struct SnapshotHeader {
+    meta: SnapshotMeta,
+    members: Option<Vec<Member>>,
+    /// Where the data begins in the file.
+    data_at: u64,
+    data_len: u64,
 }
 
 /// What the snapshot file covers and how big its data is, checking the
@@ -448,10 +520,10 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
 ///
 /// The file is read through once to check it, a piece at a time, since it
 /// is as large as the state machine.
-fn read_snapshot_header(dir: &Path) -> Result<(SnapshotMeta, u64)> {
+fn read_snapshot_header(dir: &Path) -> Result<SnapshotHeader> {
     let file = match File::open(dir.join("snapshot")) {
         Ok(file) => file,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((SnapshotMeta::default(), 0)),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(SnapshotHeader::default()),
         Err(e) => return Err(e.into()),
     };
     let corrupt = |detail| Error::Corrupt {
@@ -459,21 +531,47 @@ fn read_snapshot_header(dir: &Path) -> Result<(SnapshotMeta, u64)> {
         offset: 0,
         detail,
     };
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
-    let mut header = [0u8; SNAPSHOT_HEADER_LEN as usize];
-    match reader.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-            return Err(corrupt("the raft snapshot is shorter than its header"))
+    let short = |e: io::Error| {
+        if e.kind() == ErrorKind::UnexpectedEof {
+            corrupt("the raft snapshot is shorter than its header")
+        } else {
+            e.into()
         }
-        Err(e) => return Err(e.into()),
-    }
-    let expected = u32::from_le_bytes(header[0..4].try_into().expect("four bytes"));
-    let index = u64::from_le_bytes(header[4..12].try_into().expect("eight bytes"));
-    let term = u64::from_le_bytes(header[12..20].try_into().expect("eight bytes"));
+    };
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut first = [0u8; 4];
+    reader.read_exact(&mut first).map_err(short)?;
 
     let mut crc = Crc32::new();
-    crc.update(&header[4..]);
+    let (expected, index, term, members, data_at) = if first == SNAPSHOT_MAGIC {
+        let mut fixed = [0u8; 4 + 8 + 8 + 4];
+        reader.read_exact(&mut fixed).map_err(short)?;
+        crc.update(&fixed[4..]);
+        let expected = u32::from_le_bytes(fixed[0..4].try_into().expect("four bytes"));
+        let index = u64::from_le_bytes(fixed[4..12].try_into().expect("eight bytes"));
+        let term = u64::from_le_bytes(fixed[12..20].try_into().expect("eight bytes"));
+        let members_len = u32::from_le_bytes(fixed[20..24].try_into().expect("four bytes"));
+        let (members, extra) = if members_len == NO_MEMBERS {
+            (None, 0)
+        } else {
+            let mut encoded = vec![0u8; members_len as usize];
+            reader.read_exact(&mut encoded).map_err(short)?;
+            crc.update(&encoded);
+            let members = decode_members(&encoded)
+                .ok_or_else(|| corrupt("the raft snapshot's membership is malformed"))?;
+            (Some(members), members_len as u64)
+        };
+        (expected, index, term, members, 4 + 24 + extra)
+    } else {
+        let mut rest = [0u8; OLD_SNAPSHOT_HEADER_LEN as usize - 4];
+        reader.read_exact(&mut rest).map_err(short)?;
+        crc.update(&rest);
+        let expected = u32::from_le_bytes(first);
+        let index = u64::from_le_bytes(rest[0..8].try_into().expect("eight bytes"));
+        let term = u64::from_le_bytes(rest[8..16].try_into().expect("eight bytes"));
+        (expected, index, term, None, OLD_SNAPSHOT_HEADER_LEN)
+    };
+
     let mut len = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -490,7 +588,12 @@ fn read_snapshot_header(dir: &Path) -> Result<(SnapshotMeta, u64)> {
     if crc.finish() != expected {
         return Err(corrupt("checksum mismatch in the raft snapshot"));
     }
-    Ok((SnapshotMeta { index, term }, len))
+    Ok(SnapshotHeader {
+        meta: SnapshotMeta { index, term },
+        members,
+        data_at,
+        data_len: len,
+    })
 }
 
 /// Read the log back, stopping at the first record that a crash could have
@@ -555,13 +658,17 @@ fn recover(file: &mut File) -> Result<(Vec<Entry>, Vec<u64>, u64)> {
                 detail: "checksum mismatch in the raft log",
             });
         }
-        if key.len() != 16 {
-            return Err(Error::Corrupt {
-                file_id: 0,
-                offset: at,
-                detail: "raft log entry has a malformed key",
-            });
-        }
+        let config = match key.len() {
+            16 => false,
+            17 if key[16] == CONFIG_ENTRY => true,
+            _ => {
+                return Err(Error::Corrupt {
+                    file_id: 0,
+                    offset: at,
+                    detail: "raft log entry has a malformed key",
+                })
+            }
+        };
 
         let index = u64::from_le_bytes(key[0..8].try_into().expect("16 byte key"));
         let term = u64::from_le_bytes(key[8..16].try_into().expect("16 byte key"));
@@ -581,14 +688,21 @@ fn recover(file: &mut File) -> Result<(Vec<Entry>, Vec<u64>, u64)> {
             });
         }
 
+        let command = if config {
+            Command::Config(decode_members(value).ok_or(Error::Corrupt {
+                file_id: 0,
+                offset: at,
+                detail: "raft log membership entry is malformed",
+            })?)
+        } else if header.is_tombstone() {
+            Command::Noop
+        } else {
+            Command::Data(value.to_vec())
+        };
         entries.push(Entry {
             term,
             index,
-            command: if header.is_tombstone() {
-                Command::Noop
-            } else {
-                Command::Data(value.to_vec())
-            },
+            command,
         });
         offsets.push(at);
         at += header.record_len();
@@ -1054,6 +1168,82 @@ mod tests {
         assert_eq!(storage.read_snapshot(0, 10).unwrap(), b"newer");
     }
 
+    fn members(ids: &[u64]) -> Vec<Member> {
+        ids.iter()
+            .map(|&id| Member {
+                id,
+                context: format!("node-{id}").into_bytes(),
+            })
+            .collect()
+    }
+
+    /// A membership entry survives a reopen like any other.
+    #[test]
+    fn a_membership_entry_survives_a_reopen() {
+        let dir = Dir::new("config-entry");
+        let config = Entry {
+            term: 2,
+            index: 2,
+            command: Command::Config(members(&[1, 2, 3, 4])),
+        };
+        {
+            let mut storage = DiskStorage::open(&dir.0).unwrap();
+            storage.append(&entries(&[(1, 1)])).unwrap();
+            storage.append(std::slice::from_ref(&config)).unwrap();
+            storage.append(&entries(&[(3, 2)])).unwrap();
+        }
+        let storage = DiskStorage::open(&dir.0).unwrap();
+        assert_eq!(storage.entry(2), Some(&config));
+        assert_eq!(storage.last_index(), 3);
+    }
+
+    /// The membership as of a snapshot is part of the snapshot, since the
+    /// entry that set it may be among those the snapshot replaced.
+    #[test]
+    fn a_snapshot_keeps_its_membership() {
+        let dir = Dir::new("snap-members");
+        {
+            let mut storage = DiskStorage::open(&dir.0).unwrap();
+            storage.append(&entries(&[(1, 1), (2, 1)])).unwrap();
+            let mut sink = storage
+                .new_snapshot(meta(2, 1), Some(members(&[1, 3, 5])))
+                .unwrap();
+            sink.write_all(b"state").unwrap();
+            storage.install_snapshot(sink).unwrap();
+            assert_eq!(storage.snapshot_members(), Some(members(&[1, 3, 5])));
+        }
+        let storage = DiskStorage::open(&dir.0).unwrap();
+        assert_eq!(storage.snapshot_members(), Some(members(&[1, 3, 5])));
+        assert_eq!(storage.read_snapshot(0, 100).unwrap(), b"state");
+    }
+
+    /// A snapshot file from before membership could change is still read,
+    /// and reports no membership rather than a wrong one.
+    #[test]
+    fn a_snapshot_in_the_old_format_still_opens() {
+        let dir = Dir::new("snap-old-format");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u64.to_le_bytes());
+        body.extend_from_slice(&2u64.to_le_bytes());
+        body.extend_from_slice(b"old state");
+        let mut file = crc32_parts(&[&body]).to_le_bytes().to_vec();
+        file.extend_from_slice(&body);
+        std::fs::write(dir.0.join("snapshot"), &file).unwrap();
+
+        let storage = DiskStorage::open(&dir.0).unwrap();
+        assert_eq!(storage.snapshot_meta(), meta(7, 2));
+        assert_eq!(storage.snapshot_members(), None);
+        assert_eq!(storage.read_snapshot(0, 100).unwrap(), b"old state");
+        let mut back = Vec::new();
+        storage
+            .snapshot_reader()
+            .unwrap()
+            .read_to_end(&mut back)
+            .unwrap();
+        assert_eq!(back, b"old state");
+    }
+
     fn part_files(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .unwrap()
@@ -1068,7 +1258,7 @@ mod tests {
     fn an_abandoned_snapshot_leaves_nothing_behind() {
         let dir = Dir::new("snap-abandoned");
         let mut storage = DiskStorage::open(&dir.0).unwrap();
-        let mut sink = storage.new_snapshot(meta(3, 1)).unwrap();
+        let mut sink = storage.new_snapshot(meta(3, 1), None).unwrap();
         sink.write_all(b"half a snapshot").unwrap();
         assert_eq!(part_files(&dir.0).len(), 1);
         drop(sink);
@@ -1085,7 +1275,7 @@ mod tests {
             let mut storage = DiskStorage::open(&dir.0).unwrap();
             storage.append(&entries(&[(1, 1), (2, 1)])).unwrap();
             storage.save_snapshot(meta(2, 1), b"kept").unwrap();
-            let mut sink = storage.new_snapshot(meta(9, 1)).unwrap();
+            let mut sink = storage.new_snapshot(meta(9, 1), None).unwrap();
             sink.write_all(b"interrupted").unwrap();
             sink.flush().unwrap();
             // A crash: nothing gets to run the sink's cleanup.
@@ -1106,7 +1296,7 @@ mod tests {
         let dir = Dir::new("snap-pieces");
         let mut storage = DiskStorage::open(&dir.0).unwrap();
         let data: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
-        let mut sink = storage.new_snapshot(meta(4, 2)).unwrap();
+        let mut sink = storage.new_snapshot(meta(4, 2), None).unwrap();
         for piece in data.chunks(7_777) {
             sink.write_all(piece).unwrap();
         }

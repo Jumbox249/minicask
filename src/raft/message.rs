@@ -6,7 +6,7 @@
 //! of an [`Action`](super::Action), which keeps the transport free to
 //! authenticate the peer however it likes rather than trusting a field.
 
-use super::log::{Entry, NodeId};
+use super::log::{Entry, Member, NodeId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -79,6 +79,9 @@ pub enum Message {
         done: bool,
         /// As for `AppendEntries`.
         seq: u64,
+        /// The membership as of `last_index`, which the follower needs
+        /// because the entry that set it may be one the snapshot replaced.
+        members: Option<Vec<Member>>,
     },
     InstallSnapshotReply {
         term: u64,

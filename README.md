@@ -180,18 +180,18 @@ let actions = node.step(2, msg)?;  // a message arrives
 
 That shape is the point rather than a matter of taste. Consensus bugs are timing bugs, and a timing bug is only reproducible if the test owns the timing. `tests/raft.rs` drives whole clusters through network partitions, leader kills and restarts with no sleeps and no threads, so a failure reproduces exactly, at the same tick, every run.
 
-What it implements: elections with randomised timeouts, log replication with the term-matching induction, the up-to-date check that decides a vote, conflict backoff by term rather than one entry per round trip, and the no-op a leader appends on taking office so that entries from earlier terms become committable.
+What it implements: elections with randomised timeouts, log replication with the term-matching induction, the up-to-date check that decides a vote, conflict backoff by term rather than one entry per round trip, the no-op a leader appends on taking office so that entries from earlier terms become committable, pre-vote, check-quorum, snapshots, read-index reads on any node, and membership changes one node at a time.
 
 ### What the tests actually prove
 
-Thirty cluster scenarios and thirty-nine protocol tests, including the ones a naive implementation passes and should not:
+Thirty-eight cluster scenarios and fifty-two protocol tests, including the ones a naive implementation passes and should not:
 
 - **`a_stale_candidate_cannot_win_even_with_the_highest_term`** isolates a node until it has missed six committed entries and campaigned its term far above everyone else's, then heals the network with nothing in flight and makes it stand for election. Its term is high enough to depose the leader. Its log is not good enough to replace it, and the votes have to say so.
 - **`a_deposed_leader_steps_down_and_drops_its_orphan_entries`** feeds commands to a leader that has been cut off from everyone, then heals and requires those entries to be overwritten rather than applied.
 - **`commands_survive_relentless_churn`** runs twelve rounds of commit-then-break-something, checking after every round that no two nodes disagree about any index.
 - **`a_stale_append_does_not_shorten_the_log`** delivers a late duplicate that mentions fewer entries than the follower holds, and requires the extra ones to survive. Deleting what a message merely failed to mention is the classic way to lose a committed entry.
 
-A test suite that passes proves nothing on its own, so every safety rule here was checked by breaking it on purpose and confirming the suite noticed. Twenty-nine broken variants, each failing at least one test: removing the up-to-date check from voting, truncating the log on every append, trusting the leader's commit index, allowing two votes in one term, an off-by-one in the quorum, committing an earlier term's entry on a replica count, not standing down when cut off, not recording contact with peers, granting a pre-vote to a node that is behind, ignoring the log when answering one, dropping the leader lease, counting pre-vote replies from any round, not echoing the proposed term on a grant, sending a lagging follower its whole backlog in one message, waiting for a heartbeat between catch-up batches, accepting a command too large to replicate, re-applying the log to the store on restart, trusting a damaged applied index, and eleven ways of getting snapshots wrong: restoring by writing without deleting, rewriting unchanged values on every restore, not finishing an interrupted restore, sending entries the leader no longer has, refusing appends that start inside a snapshot, keeping a log that disagrees with an installed snapshot, splicing pieces from two leaders, accepting a piece at the wrong offset, snapshotting unapplied state, forgetting on restart that a snapshot is committed, and continuing a replaced snapshot from an old offset.
+A test suite that passes proves nothing on its own, so every safety rule here was checked by breaking it on purpose and confirming the suite noticed. Seventy-eight broken variants, each failing at least one test: removing the up-to-date check from voting, truncating the log on every append, trusting the leader's commit index, allowing two votes in one term, an off-by-one in the quorum, committing an earlier term's entry on a replica count, not standing down when cut off, not recording contact with peers, granting a pre-vote to a node that is behind, ignoring the log when answering one, dropping the leader lease, counting pre-vote replies from any round, not echoing the proposed term on a grant, sending a lagging follower its whole backlog in one message, waiting for a heartbeat between catch-up batches, accepting a command too large to replicate, re-applying the log to the store on restart, trusting a damaged applied index, and eleven ways of getting snapshots wrong: restoring by writing without deleting, rewriting unchanged values on every restore, not finishing an interrupted restore, sending entries the leader no longer has, refusing appends that start inside a snapshot, keeping a log that disagrees with an installed snapshot, splicing pieces from two leaders, accepting a piece at the wrong offset, snapshotting unapplied state, forgetting on restart that a snapshot is committed, and continuing a replaced snapshot from an old offset. Then nine more once snapshots were streamed: keeping stale keys that sort before a snapshot key, keeping ones after the last, believing a snapshot out of order, letting two snapshot jobs out at once, installing a compaction a newer snapshot overtook, leaving an abandoned part file behind, keeping stray part files across a restart, leaving the data out of the snapshot's checksum, and reading through a shared file cursor. Eight for the read index: counting a reply to any round, reading at a new leader's bare commit index, keeping a read alive after its leader loses office, keeping a forwarded read alive after the leader changes, not releasing followers' reads when a round is answered, answering a follower before its round is confirmed, a follower not echoing the round, and answering a confirmed read before the store has applied that far. Twelve for group commit: not syncing a file as it is sealed, not syncing the store before the applied index, writing the index before the sync, replying before the disk has the write, one fsync per write, two batches proposed at once, reads ignoring the write buffer, compacting, taking a view or taking a sync handle without flushing it, syncing without flushing it, and dropping it on close. Ten for hint files: never reading them, rescanning from the start after one, believing one longer than its file, believing one with gaps, not writing one when a file is sealed or compacted, leaving old ones behind after a compaction, keeping ones whose file is gone, not rebuilding a missing one, and reading them when asked to verify. And ten for membership: a follower ignoring membership entries, keeping a membership whose entry was truncated, changing two voters at once, starting a change while the last is uncommitted, changing before the new leader's no-op commits, a non-member standing, counting anyone's vote, a removed leader staying on, a snapshot forgetting the membership, and an installed snapshot not bringing it.
 
 The first attempt at this suite caught none of the subtle ones. Every scenario passed against three deliberately broken implementations, because the scenarios never built the interleavings those rules exist for. The rules that cannot be reached through ordinary operation — a leader committing an earlier term's entry is the clearest — are now tested against the state they guard, directly, rather than hoped for through a cluster.
 
@@ -247,10 +247,32 @@ None of it holds the store in memory. A snapshot is written from a point-in-time
 
 Taking a snapshot changes two files, and a crash can land between them. The snapshot is always written before the log is cut down, and opening a directory finishes whichever half was interrupted by the same rule that taking the snapshot applies: if the log agrees with the snapshot at its last entry, the entries after it are kept, and otherwise none of them are. Restoring the store is interruptible too, because the store's applied index only moves once the restore is on disk; a crash part way leaves the snapshot ahead of the store, and the next start restores it again.
 
+### Changing who is in the cluster
+
+Membership changes one node at a time, which is what makes it safe without a joint consensus: any majority of the old members and any majority of the new ones share a node, so the two can never elect a leader each. A membership is an entry in the log holding the whole list, and each node uses the newest one in its log as soon as it has it, committed or not, which is what the one-at-a-time argument needs. So it has to stop using one the moment the log loses it, too: a leader cut off with an uncommitted change loses the entry to the majority's log, and everyone who had it goes back to the membership before.
+
+Two more rules. A change is refused while another is uncommitted, since two in flight can add up to more than one node. And a leader may not propose one until it has committed an entry of its own term, without which a change it proposes can race one an earlier leader left behind; that is the bug in the original single-server algorithm, fixed the way the dissertation's errata fixes it. A leader that removes itself sees the change through, then stands down.
+
+A new node is started with `--join` and the other nodes' addresses. It then has no membership at all, and stands for nothing, until a leader adds it, after which it is caught up like any follower that has fallen behind, by entries or by snapshot:
+
+```console
+$ minicask-cluster --id 4 --dir ./n4 --raft 127.0.0.1:7004 --client 127.0.0.1:6004 --join \
+      --peer 1@127.0.0.1:7001,127.0.0.1:6001 --peer 2@127.0.0.1:7002,127.0.0.1:6002 \
+      --peer 3@127.0.0.1:7003,127.0.0.1:6003
+$ redis-cli -p 6003 RAFT.ADD 4 127.0.0.1:7004 127.0.0.1:6004
+OK
+$ redis-cli -p 6003 RAFT.REMOVE 1
+OK
+```
+
+A member's addresses travel in its membership entry, so the others learn how to reach a new node from the log. A snapshot records the membership as of its index, since the entry that set it may be one the snapshot replaced.
+
+A node that is removed stops hearing from the leader the moment the change is in the leader's log, so it never learns it was removed, and in time it asks to stand. Pre-vote and the leader lease make that harmless: nobody who is hearing from a leader says yes. It should still be shut down.
+
 ### What it does not do yet
 
 - **Store compaction still holds the lock.** When a snapshot finds more than half the store is dead records it compacts the store, and that rewrites every live record while consensus waits. It happens at most once per snapshot. Restoring a snapshot also holds the lock, on a follower that is not serving anything until it is done.
-- **Fixed membership.** Adding or removing a node means restarting the cluster.
+- **A new node votes before it has caught up.** It counts towards a majority from the moment it is added, so while a large store is being sent to it the cluster can tolerate one fewer failure than its size suggests. Adding it as a non-voting learner first, and promoting it once it has caught up, would close that.
 
 ## A replicated store
 
@@ -277,7 +299,10 @@ term:1
 leader:3
 commit_index:3
 applied_index:3
+last_index:3
+snapshot_index:0
 keys:1
+members:1,2,3
 ```
 
 Kill node 3 and the other two elect a replacement in well under a second, with every acknowledged write intact. Start it again and it comes back off its own disk, learns it is behind, and is caught up by the new leader.
@@ -313,13 +338,13 @@ A restarted node relearns its commit index from its snapshot onwards, so every c
 $ cargo test
 ```
 
-196 tests, including the three that matter:
+253 tests, including the three that matter:
 
 - **`a_killed_writer_loses_nothing_it_finished`** spawns a real child process that writes 500 records, scribbles a header with no body onto the end of the file, then calls `abort()`. No destructor runs, no buffer is flushed, the kernel takes the process out with `SIGABRT`. The test then reopens the store and checks all 500 records, and that it is still writable afterwards.
 - **`corruption_in_a_sealed_file_is_reported`** flips a bit in a file that was already closed and asserts the store refuses to open rather than pretending when asked to verify at open, and that opened from the file's hint it reports the damaged record when it is read, never handing it back.
 - **`deleted_keys_do_not_come_back_after_a_compaction`** guards the ordering rule that makes compaction safe.
 
-`tests/raft.rs` is a deterministic cluster harness, described above. `tests/replicated.rs` runs three replicas on real files through partitions, leader kills and restarts, checking after every round that no two of them hold different data. `tests/cluster.rs` starts three actual `minicask-cluster` processes and does it over TCP. `tests/server.rs` starts the real `minicask-server` binary and talks to it over a socket: pipelining, inline commands, binary-safe values, eight clients writing at once, a protocol error that must not affect other connections, and a `kill` followed by a restart on the same directory.
+`tests/raft.rs` is a deterministic cluster harness, described above. `tests/replicated.rs` runs three replicas on real files through partitions, leader kills and restarts, checking after every round that no two of them hold different data. `tests/cluster.rs` starts three actual `minicask-cluster` processes and does it over TCP, including reads on followers and a fourth node joining while another leaves. `tests/hints.rs` opens stores from their hint files, and from damaged, missing and orphaned ones. `tests/server.rs` starts the real `minicask-server` binary and talks to it over a socket: pipelining, inline commands, binary-safe values, eight clients writing at once, a protocol error that must not affect other connections, and a `kill` followed by a restart on the same directory.
 
 ## Layout
 
@@ -328,6 +353,7 @@ src/crc.rs      CRC-32, table built at compile time
 src/record.rs   the on-disk record format
 src/log.rs      data files, the append writer, the recovery scanner
 src/store.rs    the index, the read path, recovery, compaction
+src/hint.rs     hint files: a data file's index, so opening skips the values
 src/resp.rs     the Redis wire protocol, both directions
 src/server.rs   the TCP server and its command table
 src/raft/       consensus: the log, snapshots, the RPCs, the state machine, the wire

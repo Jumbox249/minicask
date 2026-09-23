@@ -32,8 +32,8 @@
 use crate::crc::crc32_parts;
 use crate::error::{Error, Result};
 use crate::raft::{
-    Accepted, Action, Command, Message, Node, NodeId, ProposeError, ReadRequest, ReadState, Role,
-    SnapshotSink, Storage,
+    Accepted, Action, Command, Member, Message, Node, NodeId, ProposeError, ReadRequest, ReadState,
+    Role, SnapshotSink, Storage,
 };
 use crate::record::{self, Header, HEADER_LEN};
 use crate::store::{Store, StoreView};
@@ -336,6 +336,14 @@ impl<S: Storage> ReplicatedStore<S> {
         self.node.propose_batch(commands)
     }
 
+    /// Change who is in the cluster. See [`Node::propose_membership`].
+    pub fn propose_membership(
+        &mut self,
+        members: Vec<Member>,
+    ) -> std::result::Result<Accepted, ProposeError> {
+        self.node.propose_membership(members)
+    }
+
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> std::result::Result<Accepted, ProposeError> {
         self.propose(&Op::Put {
             key: key.to_vec(),
@@ -412,7 +420,8 @@ impl<S: Storage> ReplicatedStore<S> {
                 continue;
             }
             match &entry.command {
-                Command::Noop => {}
+                // Membership is consensus business, not the store's.
+                Command::Noop | Command::Config(_) => {}
                 // Not synced one at a time: the whole batch is synced once,
                 // below, before the applied index says it is there. Until
                 // then the log still holds every one of these, so a crash

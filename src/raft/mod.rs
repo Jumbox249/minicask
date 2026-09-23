@@ -36,8 +36,8 @@ mod storage;
 pub mod wire;
 
 pub use log::{
-    Command, Entry, HardState, MemSnapshot, MemStorage, NodeId, SnapshotMeta, SnapshotSink,
-    Storage, StorageExt,
+    decode_members, encode_members, Command, Entry, HardState, MemSnapshot, MemStorage, Member,
+    NodeId, SnapshotMeta, SnapshotSink, Storage, StorageExt,
 };
 pub use message::{Action, Message};
 pub use node::{Accepted, Config, Node, ProposeError, ReadRequest, ReadState, Role};

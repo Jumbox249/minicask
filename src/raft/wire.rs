@@ -12,7 +12,7 @@
 //! 20 ..      the message
 //! ```
 
-use super::log::{Command, Entry, NodeId};
+use super::log::{decode_members, encode_members, Command, Entry, Member, NodeId};
 use super::message::Message;
 use crate::crc::crc32_parts;
 use std::io::{self, Read, Write};
@@ -37,6 +37,7 @@ const READ_INDEX_REPLY: u8 = 10;
 /// Tags for a log entry's payload.
 const ENTRY_NOOP: u8 = 0;
 const ENTRY_DATA: u8 = 1;
+const ENTRY_CONFIG: u8 = 2;
 
 pub fn write_message<W: Write>(w: &mut W, from: NodeId, message: &Message) -> io::Result<()> {
     let body = encode(message);
@@ -140,6 +141,12 @@ fn encode(message: &Message) -> Vec<u8> {
                         put_u64(&mut out, &[bytes.len() as u64]);
                         out.extend_from_slice(bytes);
                     }
+                    Command::Config(members) => {
+                        let encoded = encode_members(members);
+                        out.push(ENTRY_CONFIG);
+                        put_u64(&mut out, &[encoded.len() as u64]);
+                        out.extend_from_slice(&encoded);
+                    }
                 }
             }
         }
@@ -151,6 +158,7 @@ fn encode(message: &Message) -> Vec<u8> {
             data,
             done,
             seq,
+            members,
         } => {
             out.push(INSTALL_SNAPSHOT);
             put_u64(
@@ -166,6 +174,7 @@ fn encode(message: &Message) -> Vec<u8> {
             );
             out.extend_from_slice(data);
             out.push(u8::from(*done));
+            put_members(&mut out, members.as_deref());
         }
         Message::InstallSnapshotReply {
             term,
@@ -257,6 +266,7 @@ fn decode(body: &[u8]) -> Option<Message> {
                 let command = match kind {
                     ENTRY_NOOP => Command::Noop,
                     ENTRY_DATA => Command::Data(r.bytes(len)?.to_vec()),
+                    ENTRY_CONFIG => Command::Config(decode_members(r.bytes(len)?)?),
                     _ => return None,
                 };
                 entries.push(Entry {
@@ -282,14 +292,16 @@ fn decode(body: &[u8]) -> Option<Message> {
             let seq = r.u64()?;
             let len = r.u64()?;
             let data = r.bytes(len)?.to_vec();
+            let done = r.bool()?;
             Message::InstallSnapshot {
                 term,
                 last_index,
                 last_term,
                 offset,
                 data,
-                done: r.bool()?,
+                done,
                 seq,
+                members: r.members()?,
             }
         }
         INSTALL_SNAPSHOT_REPLY => Message::InstallSnapshotReply {
@@ -337,6 +349,19 @@ fn decode(body: &[u8]) -> Option<Message> {
     (r.at == body.len()).then_some(message)
 }
 
+/// A flag for whether there is a membership, then its length and bytes.
+fn put_members(out: &mut Vec<u8>, members: Option<&[Member]>) {
+    match members {
+        Some(members) => {
+            let encoded = encode_members(members);
+            out.push(1);
+            put_u64(out, &[encoded.len() as u64]);
+            out.extend_from_slice(&encoded);
+        }
+        None => out.push(0),
+    }
+}
+
 fn put_u64(out: &mut Vec<u8>, values: &[u64]) {
     for value in values {
         out.extend_from_slice(&value.to_le_bytes());
@@ -372,6 +397,15 @@ impl<'a> Reader<'a> {
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.bytes(8)?.try_into().ok()?))
     }
+
+    /// `Some(None)` for no membership, and `None` for a malformed one.
+    fn members(&mut self) -> Option<Option<Vec<Member>>> {
+        if !self.bool()? {
+            return Some(None);
+        }
+        let len = self.u64()?;
+        Some(Some(decode_members(self.bytes(len)?)?))
+    }
 }
 
 fn invalid(detail: &'static str) -> io::Error {
@@ -400,6 +434,16 @@ mod tests {
             data: b"\r\n\0binary snapshot bytes\xff".to_vec(),
             done: false,
             seq: 41,
+            members: Some(vec![
+                Member {
+                    id: 1,
+                    context: b"a b".to_vec(),
+                },
+                Member {
+                    id: 2,
+                    context: Vec::new(),
+                },
+            ]),
         });
         round_trip(Message::InstallSnapshot {
             term: 4,
@@ -409,6 +453,7 @@ mod tests {
             data: Vec::new(),
             done: true,
             seq: 0,
+            members: None,
         });
         round_trip(Message::InstallSnapshotReply {
             term: 4,
@@ -501,6 +546,14 @@ mod tests {
                     term: 5,
                     index: 5,
                     command: Command::Data(Vec::new()),
+                },
+                Entry {
+                    term: 5,
+                    index: 6,
+                    command: Command::Config(vec![Member {
+                        id: 9,
+                        context: b"127.0.0.1:7009 127.0.0.1:6009".to_vec(),
+                    }]),
                 },
             ],
             leader_commit: 3,

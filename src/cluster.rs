@@ -26,7 +26,7 @@
 
 use crate::error::Result;
 use crate::raft::{
-    wire, Action, Config, DiskStorage, Message, Node, NodeId, ProposeError, ReadState, Role,
+    wire, Action, Config, DiskStorage, Member, Message, Node, NodeId, ProposeError, ReadState, Role,
 };
 use crate::replicated::{Op, ReplicatedStore};
 use crate::resp::{self, Reply};
@@ -62,7 +62,15 @@ pub struct Peer {
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
     pub id: NodeId,
+    /// Where to reach the other nodes. On a new cluster these, with this
+    /// node, are also its first membership; see `join`. An address given
+    /// here always wins over one learned from the log.
     pub peers: Vec<Peer>,
+    /// Join a cluster that already exists instead of starting a new one.
+    /// The node then starts with no membership, stands for nothing, and
+    /// waits for a leader to add it with `RAFT.ADD`. Only matters the first
+    /// time: once the node has a membership in its log, it uses that.
+    pub join: bool,
     /// Milliseconds per consensus tick. The election timeouts in
     /// [`Config`] are counted in these.
     pub tick_ms: u64,
@@ -72,12 +80,68 @@ pub struct ClusterConfig {
     pub snapshot_every: u64,
 }
 
-impl ClusterConfig {
-    fn ids(&self) -> Vec<NodeId> {
-        let mut ids: Vec<NodeId> = self.peers.iter().map(|p| p.id).collect();
-        ids.push(self.id);
-        ids.sort_unstable();
-        ids
+/// How a member's addresses travel in the log: both of them, space
+/// separated, as the member's context.
+fn member_context(raft_addr: &str, client_addr: &str) -> Vec<u8> {
+    format!("{raft_addr} {client_addr}").into_bytes()
+}
+
+fn parse_context(context: &[u8]) -> Option<(String, String)> {
+    let text = std::str::from_utf8(context).ok()?;
+    let (raft, client) = text.split_once(' ')?;
+    Some((raft.to_string(), client.to_string()))
+}
+
+/// Where to reach every node this one knows of. The configured peers are
+/// fixed; members learned from the log come and go with the membership.
+struct AddressBook {
+    me: NodeId,
+    configured: HashMap<NodeId, Peer>,
+    /// One queue per peer. The mutex is not for contention, which there
+    /// is none of: a `Sender` is `Send` but was not `Sync` until Rust
+    /// 1.72, and this crate builds on 1.70. Wrapping each one separately
+    /// rather than the map keeps dispatch to one peer off another's path.
+    senders: HashMap<NodeId, Mutex<Sender<Message>>>,
+    client_addrs: HashMap<NodeId, String>,
+    /// The membership index this was last brought up to date with.
+    seen: u64,
+}
+
+impl AddressBook {
+    /// Start a sender for a peer, or leave the one that is there.
+    fn connect(&mut self, id: NodeId, raft_addr: String, client_addr: String) {
+        if id == self.me || self.senders.contains_key(&id) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let me = self.me;
+        let spawned = thread::Builder::new()
+            .name(format!("peer-{id}"))
+            .spawn(move || send_to_peer(me, &raft_addr, rx));
+        if spawned.is_ok() {
+            self.senders.insert(id, Mutex::new(tx));
+            self.client_addrs.insert(id, client_addr);
+        }
+    }
+
+    /// Make the book match a membership: reach every member, and stop
+    /// reaching anyone it has dropped who was only known from the log.
+    /// Dropping a sender ends its thread.
+    fn update(&mut self, members: &[Member]) {
+        for member in members {
+            if let Some(peer) = self.configured.get(&member.id) {
+                let (raft, client) = (peer.raft_addr.clone(), peer.client_addr.clone());
+                self.connect(member.id, raft, client);
+            } else if let Some((raft, client)) = parse_context(&member.context) {
+                self.connect(member.id, raft, client);
+            }
+        }
+        let keep: Vec<NodeId> = members.iter().map(|m| m.id).collect();
+        let configured = &self.configured;
+        self.senders
+            .retain(|id, _| keep.contains(id) || configured.contains_key(id));
+        self.client_addrs
+            .retain(|id, _| keep.contains(id) || configured.contains_key(id));
     }
 }
 
@@ -89,12 +153,7 @@ struct Shared {
     /// does not have to poll, and does not hold the replica while it waits.
     changes: Mutex<u64>,
     progress: Condvar,
-    /// One queue per peer. The mutex is not for contention, which there
-    /// is none of: a `Sender` is `Send` but was not `Sync` until Rust
-    /// 1.72, and this crate builds on 1.70. Wrapping each one separately
-    /// rather than the map keeps dispatch to one peer off another's path.
-    senders: HashMap<NodeId, Mutex<Sender<Message>>>,
-    client_addrs: HashMap<NodeId, String>,
+    addresses: RwLock<AddressBook>,
     proposals: Proposals,
 }
 
@@ -222,10 +281,19 @@ impl Shared {
         }
     }
 
+    fn addresses(&self) -> RwLockReadGuard<'_, AddressBook> {
+        self.addresses.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn client_addr(&self, id: NodeId) -> Option<String> {
+        self.addresses().client_addrs.get(&id).cloned()
+    }
+
     /// Hand a node's outgoing messages to the per-peer queues.
     fn dispatch(&self, actions: Vec<Action>) {
+        let book = self.addresses();
         for Action::Send { to, message } in actions {
-            if let Some(sender) = self.senders.get(&to) {
+            if let Some(sender) = book.senders.get(&to) {
                 // A full or dead queue is not an error worth reporting:
                 // Raft resends on the next heartbeat.
                 let sender = sender.lock().unwrap_or_else(|e| e.into_inner());
@@ -234,13 +302,28 @@ impl Shared {
         }
     }
 
+    /// If the membership has moved since the address book last looked,
+    /// bring the book up to date. Called with the replica in hand, so the
+    /// membership cannot move again while this reads it.
+    fn follow_membership(&self, replica: &Replica) {
+        let index = replica.node().membership_index();
+        if self.addresses().seen == index {
+            return;
+        }
+        let mut book = self.addresses.write().unwrap_or_else(|e| e.into_inner());
+        book.update(replica.node().members());
+        book.seen = index;
+    }
+
     fn step(&self, from: NodeId, message: Message) {
         let actions = {
             let mut replica = self.lock();
-            match replica.step(from, message) {
+            let actions = match replica.step(from, message) {
                 Ok(actions) => actions,
                 Err(e) => storage_failed(&e),
-            }
+            };
+            self.follow_membership(&replica);
+            actions
         };
         self.changed();
         self.dispatch(actions);
@@ -278,36 +361,58 @@ impl ClusterNode {
                 "max_append_bytes plus max_entry_bytes must stay under the frame limit",
             )));
         }
+        let raft_listener = TcpListener::bind(raft_addr)?;
+        let client_listener = TcpListener::bind(client_addr)?;
+
+        // A new cluster's first membership is this node and its peers. A
+        // node joining one that exists has none until a leader adds it.
+        let bootstrap = if config.join {
+            Vec::new()
+        } else {
+            let mut members: Vec<Member> = config
+                .peers
+                .iter()
+                .map(|p| Member {
+                    id: p.id,
+                    context: member_context(&p.raft_addr, &p.client_addr),
+                })
+                .collect();
+            members.push(Member {
+                id: config.id,
+                context: member_context(
+                    &raft_listener.local_addr()?.to_string(),
+                    &client_listener.local_addr()?.to_string(),
+                ),
+            });
+            members.sort_unstable_by_key(|m| m.id);
+            members
+        };
+
         let storage = DiskStorage::open(raft_dir)?;
         let store = Store::open(store_dir)?;
-        let node = Node::new(config.id, config.ids(), config.raft, storage);
+        let node = Node::with_members(config.id, bootstrap, config.raft, storage);
         let mut replica = ReplicatedStore::new(node, store)?;
         replica.set_snapshot_every(config.snapshot_every);
         replica.set_background_snapshots(true);
 
-        let raft_listener = TcpListener::bind(raft_addr)?;
-        let client_listener = TcpListener::bind(client_addr)?;
-
-        let mut senders = HashMap::new();
-        let mut client_addrs = HashMap::new();
+        let mut book = AddressBook {
+            me: config.id,
+            configured: config.peers.iter().map(|p| (p.id, p.clone())).collect(),
+            senders: HashMap::new(),
+            client_addrs: HashMap::new(),
+            seen: replica.node().membership_index(),
+        };
         for peer in &config.peers {
-            let (tx, rx) = mpsc::channel();
-            senders.insert(peer.id, Mutex::new(tx));
-            client_addrs.insert(peer.id, peer.client_addr.clone());
-            let addr = peer.raft_addr.clone();
-            let id = config.id;
-            thread::Builder::new()
-                .name(format!("peer-{}", peer.id))
-                .spawn(move || send_to_peer(id, &addr, rx))?;
+            book.connect(peer.id, peer.raft_addr.clone(), peer.client_addr.clone());
         }
+        book.update(replica.node().members());
 
         Ok(ClusterNode {
             shared: Arc::new(Shared {
                 replica: RwLock::new(replica),
                 changes: Mutex::new(0),
                 progress: Condvar::new(),
-                senders,
-                client_addrs,
+                addresses: RwLock::new(book),
                 proposals: Proposals::new(),
             }),
             raft_listener,
@@ -367,6 +472,7 @@ fn ticker(shared: &Arc<Shared>, tick: Duration) {
                 Ok(actions) => actions,
                 Err(e) => storage_failed(&e),
             };
+            shared.follow_membership(&replica);
             let job = match replica.start_snapshot() {
                 Ok(job) => job,
                 Err(e) => {
@@ -593,13 +699,54 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
             _ => Reply::err("this cluster's DEL takes one key"),
         },
 
+        // Changing who is in the cluster, one node at a time.
+        "RAFT.ADD" => match rest {
+            [id, raft_addr, client_addr] => {
+                let Some(id) = parse_id(id) else {
+                    return Reply::err("RAFT.ADD wants a numeric node id");
+                };
+                let (Ok(raft_addr), Ok(client_addr)) = (
+                    std::str::from_utf8(raft_addr),
+                    std::str::from_utf8(client_addr),
+                ) else {
+                    return Reply::err("addresses must be text");
+                };
+                let context = member_context(raft_addr, client_addr);
+                change_membership(shared, |members| {
+                    if members.iter().any(|m| m.id == id) {
+                        return Err(format!("node {id} is already a member"));
+                    }
+                    members.push(Member { id, context });
+                    members.sort_unstable_by_key(|m| m.id);
+                    Ok(())
+                })
+            }
+            _ => wrong_arity(&name),
+        },
+        "RAFT.REMOVE" => match rest {
+            [id] => {
+                let Some(id) = parse_id(id) else {
+                    return Reply::err("RAFT.REMOVE wants a numeric node id");
+                };
+                change_membership(shared, |members| {
+                    let before = members.len();
+                    members.retain(|m| m.id != id);
+                    if members.len() == before {
+                        return Err(format!("node {id} is not a member"));
+                    }
+                    Ok(())
+                })
+            }
+            _ => wrong_arity(&name),
+        },
+
         // Where the cluster stands, which is the first thing anyone asks.
         "RAFT" | "INFO" => {
             let replica = shared.read();
             let node = replica.node();
             Reply::Bulk(
                 format!(
-                    "id:{}\r\nrole:{}\r\nterm:{}\r\nleader:{}\r\ncommit_index:{}\r\napplied_index:{}\r\nlast_index:{}\r\nsnapshot_index:{}\r\nkeys:{}\r\n",
+                    "id:{}\r\nrole:{}\r\nterm:{}\r\nleader:{}\r\ncommit_index:{}\r\napplied_index:{}\r\nlast_index:{}\r\nsnapshot_index:{}\r\nkeys:{}\r\nmembers:{}\r\n",
                     node.id(),
                     match node.role() {
                         Role::Leader => "leader",
@@ -614,6 +761,11 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
                     node.last_index(),
                     replica.snapshot_index(),
                     replica.len(),
+                    node.members()
+                        .iter()
+                        .map(|m| m.id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
                 )
                 .into_bytes(),
             )
@@ -708,10 +860,55 @@ fn write(shared: &Arc<Shared>, op: &Op) -> Reply {
     })
 }
 
+fn parse_id(bytes: &[u8]) -> Option<NodeId> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+/// Propose a membership made by editing the current one, and wait for it
+/// to commit, which is when it is safe to make the next change.
+fn change_membership(
+    shared: &Arc<Shared>,
+    edit: impl FnOnce(&mut Vec<Member>) -> std::result::Result<(), String>,
+) -> Reply {
+    let (index, term, actions) = {
+        let mut replica = shared.lock();
+        let mut members = replica.node().members().to_vec();
+        if let Err(why) = edit(&mut members) {
+            return Reply::err(why);
+        }
+        match replica.propose_membership(members) {
+            Ok(accepted) => {
+                shared.follow_membership(&replica);
+                (accepted.index, replica.node().term(), accepted.actions)
+            }
+            Err(ProposeError::NotLeader { .. }) => return not_leader(shared, &replica),
+            Err(e) => return Reply::err(e.to_string()),
+        }
+    };
+    shared.dispatch(actions);
+
+    let deadline = Instant::now() + COMMIT_TIMEOUT;
+    let outcome = shared.wait_for(deadline, |replica| {
+        if replica.commit_index() >= index {
+            return Some(Reply::ok());
+        }
+        if replica.node().term() != term {
+            return Some(Reply::Error(
+                "NOTLEADER leadership was lost before the change committed; its fate is unknown"
+                    .to_string(),
+            ));
+        }
+        None
+    });
+    outcome.unwrap_or_else(|| {
+        Reply::Error("TIMEOUT the change did not commit in time; it may still do so".to_string())
+    })
+}
+
 /// Redis clients know `-MOVED addr` from cluster mode, so a redirect in
 /// that shape is the one most likely to be understood.
 fn not_leader(shared: &Arc<Shared>, replica: &Replica) -> Reply {
-    match replica.leader().and_then(|id| shared.client_addrs.get(&id)) {
+    match replica.leader().and_then(|id| shared.client_addr(id)) {
         Some(addr) => Reply::Error(format!("MOVED 0 {addr}")),
         None => {
             Reply::Error("CLUSTERDOWN no leader is known; the cluster has no majority".to_string())

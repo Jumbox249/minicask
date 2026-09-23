@@ -10,8 +10,8 @@
 //! the state it had persisted.
 
 use minicask::raft::{
-    Action, Command, Config, Entry, MemStorage, Message, Node, NodeId, ReadRequest, ReadState,
-    Role, Storage,
+    Action, Command, Config, Entry, MemStorage, Member, Message, Node, NodeId, ProposeError,
+    ReadRequest, ReadState, Role, Storage,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -40,6 +40,9 @@ struct Cluster {
     /// state machines is caught rather than inferred.
     applied: HashMap<NodeId, Vec<Entry>>,
     ticks: u64,
+    /// Nodes added after the start, which come back from a restart with no
+    /// membership of their own, as a real joining node does.
+    joined: HashSet<NodeId>,
 }
 
 impl Cluster {
@@ -64,6 +67,7 @@ impl Cluster {
             inflight: Vec::new(),
             severed: HashSet::new(),
             ticks: 0,
+            joined: HashSet::new(),
         }
     }
 
@@ -187,8 +191,47 @@ impl Cluster {
             Slot::Down(storage) => storage,
             Slot::Running(node) => node.into_storage(),
         };
-        let node = Node::new(id, self.ids.clone(), self.config, storage);
+        let bootstrap = if self.joined.contains(&id) {
+            Vec::new()
+        } else {
+            self.ids.clone()
+        };
+        let node = Node::new(id, bootstrap, self.config, storage);
         self.slots.insert(id, Slot::Running(Box::new(node)));
+    }
+
+    /// Start a brand new node that belongs to nothing yet. It will not
+    /// stand for election; it waits for a leader to add it.
+    fn start_joining(&mut self, id: NodeId) {
+        let node = Node::new(id, Vec::new(), self.config, MemStorage::new());
+        self.slots.insert(id, Slot::Running(Box::new(node)));
+        self.ids.push(id);
+        self.applied.insert(id, Vec::new());
+        self.joined.insert(id);
+    }
+
+    fn change_membership(&mut self, leader: NodeId, ids: &[NodeId]) -> Result<u64, ProposeError> {
+        let members = ids
+            .iter()
+            .map(|&id| Member {
+                id,
+                context: Vec::new(),
+            })
+            .collect();
+        match self.slots.get_mut(&leader) {
+            Some(Slot::Running(node)) => {
+                let accepted = node.propose_membership(members)?;
+                queue(&mut self.inflight, leader, accepted.actions);
+                Ok(accepted.index)
+            }
+            _ => panic!("node {leader} is not running"),
+        }
+    }
+
+    fn voters(&self, id: NodeId) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self.node(id).members().iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        ids
     }
 
     // -- inspection -----------------------------------------------------
@@ -306,7 +349,7 @@ impl Cluster {
             .iter()
             .filter_map(|e| match &e.command {
                 Command::Data(bytes) => Some(bytes.clone()),
-                Command::Noop => None,
+                Command::Noop | Command::Config(_) => None,
             })
             .collect()
     }
@@ -1395,5 +1438,216 @@ fn a_follower_read_covers_every_write_acknowledged_before_it() {
             ),
             other => panic!("round {round}: the read was not confirmed: {other:?}"),
         }
+    }
+}
+
+// -- membership ---------------------------------------------------------
+
+fn settled_leader(c: &mut Cluster) -> NodeId {
+    c.run_until("a leader with its no-op committed", |c| {
+        c.leader().is_some_and(|l| c.node(l).ready_to_serve())
+    });
+    c.leader().expect("leader")
+}
+
+/// A node that is added starts with nothing, is caught up by the leader,
+/// and then counts: the cluster of four needs three of them.
+#[test]
+fn a_node_can_be_added_and_is_caught_up() {
+    let mut c = Cluster::new(3);
+    let leader = settled_leader(&mut c);
+    for i in 0..5u8 {
+        c.propose(leader, &[b'a', i]);
+    }
+    c.start_joining(4);
+    c.tick_n(40);
+    assert!(
+        !c.node(4).is_voter() && c.node(4).role() == Role::Follower,
+        "a node nobody has added stood for something"
+    );
+
+    let change = c
+        .change_membership(leader, &[1, 2, 3, 4])
+        .expect("accepted");
+    c.run_until("the change to commit everywhere", |c| {
+        c.ids.iter().all(|&id| c.committed_on(id) >= change)
+    });
+    for id in 1..=4 {
+        assert_eq!(c.voters(id), vec![1, 2, 3, 4], "node {id}");
+    }
+    assert_eq!(c.applied_data(4), c.applied_data(leader), "caught up");
+
+    // Two of four is no longer a majority.
+    let others: Vec<NodeId> = (1..=4).filter(|&id| id != leader).collect();
+    c.partition(&[&[leader, others[0]], &others[1..]]);
+    let stuck = c.propose(leader, b"half the cluster");
+    c.tick_n(15);
+    assert!(
+        c.committed_on(leader) < stuck,
+        "two of four nodes committed a write"
+    );
+    c.heal();
+    c.run_until("the write to commit once healed", |c| {
+        c.leader().is_some_and(|l| c.committed_on(l) >= stuck)
+    });
+    c.assert_logs_agree();
+}
+
+/// A follower that is removed is left alone, and the two left carry on
+/// as a cluster of two, which needs both.
+#[test]
+fn a_removed_follower_is_left_behind_and_never_leads() {
+    let mut c = Cluster::new(3);
+    let leader = settled_leader(&mut c);
+    let gone = c.ids.iter().copied().find(|&id| id != leader).expect("one");
+    let keep: Vec<NodeId> = c.ids.iter().copied().filter(|&id| id != gone).collect();
+
+    let change = c.change_membership(leader, &keep).expect("accepted");
+    c.run_until("the removal to commit on the rest", |c| {
+        keep.iter().all(|&id| c.committed_on(id) >= change)
+    });
+    let term = c.node(leader).term();
+    let after = c.propose(leader, b"after the removal");
+    c.run_until("the survivors to commit", |c| {
+        keep.iter().all(|&id| c.committed_on(id) >= after)
+    });
+
+    // The leader stops sending to the removed node the moment the change
+    // is in its log, so the node never hears that it was removed, and in
+    // time it asks to stand. Pre-vote and the leader lease are what make
+    // that harmless: nobody who hears from the leader says yes, so the
+    // node never leads and the leader's term never moves.
+    for _ in 0..300 {
+        c.tick();
+        assert_ne!(c.node(gone).role(), Role::Leader);
+    }
+    assert_eq!(
+        c.leader(),
+        Some(leader),
+        "the removed node unseated the leader"
+    );
+    assert_eq!(c.node(leader).term(), term);
+}
+
+/// A leader can remove itself. It sees the change through, then stands
+/// down, and one of the others takes over.
+#[test]
+fn a_leader_that_removes_itself_hands_over_once_the_change_commits() {
+    let mut c = Cluster::new(3);
+    let leader = settled_leader(&mut c);
+    let keep: Vec<NodeId> = c.ids.iter().copied().filter(|&id| id != leader).collect();
+
+    let change = c.change_membership(leader, &keep).expect("accepted");
+    assert!(
+        c.node(leader).is_leader(),
+        "it has to finish the change first"
+    );
+    c.run_until("a new leader among the rest", |c| {
+        c.leader_in_group(&keep).is_some()
+    });
+    let new = c.leader_in_group(&keep).expect("leader");
+    assert!(!c.node(leader).is_leader());
+    // The old leader may stand down the moment the change commits, before
+    // telling anyone it has. The change is on both of the others, so the
+    // new leader commits it along with its own no-op.
+    c.run_until("the new leader to commit the change", |c| {
+        c.committed_on(new) >= change
+    });
+
+    let after = c.propose(new, b"under new management");
+    c.run_until("the rest to commit", |c| {
+        keep.iter().all(|&id| c.committed_on(id) >= after)
+    });
+    c.tick_n(200);
+    assert!(!c.node(leader).is_leader(), "the old leader came back");
+}
+
+/// Changes go one at a time, and one voter at a time.
+#[test]
+fn membership_changes_one_voter_at_a_time() {
+    let mut c = Cluster::new(3);
+    let leader = settled_leader(&mut c);
+    c.start_joining(4);
+    c.start_joining(5);
+
+    assert!(matches!(
+        c.change_membership(leader, &[1, 2, 3, 4, 5]),
+        Err(ProposeError::Membership(_))
+    ));
+    c.change_membership(leader, &[1, 2, 3, 4])
+        .expect("one at a time is fine");
+    assert!(
+        matches!(
+            c.change_membership(leader, &[1, 2, 3, 4, 5]),
+            Err(ProposeError::Membership(_))
+        ),
+        "a second change was accepted while the first was uncommitted"
+    );
+    let follower = c.ids.iter().copied().find(|&id| id != leader).expect("one");
+    assert!(matches!(
+        c.change_membership(follower, &[1, 2, 3]),
+        Err(ProposeError::NotLeader { .. })
+    ));
+}
+
+/// A membership takes effect as soon as it is in the log, so it has to
+/// stop the moment it is not. A leader cut off with an uncommitted change
+/// loses it to the majority's log, and so does everyone who had it.
+#[test]
+fn an_uncommitted_membership_change_is_undone_with_its_entry() {
+    let mut c = Cluster::new(5);
+    let leader = settled_leader(&mut c);
+    let mut others: Vec<NodeId> = c.ids.iter().copied().filter(|&id| id != leader).collect();
+    let (partner, majority) = (others.remove(0), others);
+
+    // The leader and one follower get the change; the other three do not.
+    c.partition(&[&[leader, partner], &majority]);
+    c.change_membership(leader, &[1, 2, 3, 4, 5, 6])
+        .expect("accepted");
+    c.tick_n(4);
+    assert!(
+        c.voters(partner).contains(&6),
+        "the change reached its partner"
+    );
+
+    c.run_until("the majority to elect its own leader", |c| {
+        c.leader_in_group(&majority).is_some()
+    });
+    let new = c.leader_in_group(&majority).expect("leader");
+    let write = c.propose(new, b"overwrites the change");
+    c.run_until("the majority to commit", |c| c.committed_on(new) >= write);
+
+    c.heal();
+    c.run_until("everyone to catch up", |c| {
+        c.ids.iter().all(|&id| c.committed_on(id) >= write)
+    });
+    for id in 1..=5 {
+        assert_eq!(
+            c.voters(id),
+            vec![1, 2, 3, 4, 5],
+            "node {id} kept a membership its log no longer holds"
+        );
+    }
+    c.assert_logs_agree();
+}
+
+/// The membership survives a restart, whether it is still in the log or
+/// has been folded into a snapshot.
+#[test]
+fn a_restarted_node_keeps_its_membership() {
+    let mut c = Cluster::new(3);
+    let leader = settled_leader(&mut c);
+    c.start_joining(4);
+    let change = c
+        .change_membership(leader, &[1, 2, 3, 4])
+        .expect("accepted");
+    c.run_until("the change to commit everywhere", |c| {
+        c.ids.iter().all(|&id| c.committed_on(id) >= change)
+    });
+
+    for id in [4, leader] {
+        c.kill(id);
+        c.restart(id);
+        assert_eq!(c.voters(id), vec![1, 2, 3, 4], "node {id} after a restart");
     }
 }

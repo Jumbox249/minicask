@@ -189,6 +189,25 @@ impl Cluster {
         let index = self.nodes.iter().position(|n| n.id == id).expect("known");
         spawn(&mut self.nodes, index);
     }
+
+    /// Start a new node that joins the running cluster rather than
+    /// starting one of its own. It knows where the others are, from its
+    /// flags; they learn where it is when it is added.
+    fn join(&mut self, id: u64) {
+        let dir = self.nodes[0].dir.replace("node-1", &format!("node-{id}"));
+        let mut extra = self.nodes[0].extra.clone();
+        extra.push("--join".to_string());
+        self.nodes.push(Node {
+            id,
+            child: None,
+            raft_addr: format!("127.0.0.1:{}", free_port()),
+            client_addr: format!("127.0.0.1:{}", free_port()),
+            dir,
+            extra,
+        });
+        let index = self.nodes.len() - 1;
+        spawn(&mut self.nodes, index);
+    }
 }
 
 impl Drop for Cluster {
@@ -463,5 +482,59 @@ fn a_node_down_past_the_compacted_log_is_caught_up_by_snapshot() {
     );
     for id in c.ids() {
         assert_eq!(c.field(id, "keys").as_deref(), Some("30"), "node {id}");
+    }
+}
+
+/// Membership over real processes: a fourth node joins a running cluster
+/// with nothing, is added, catches up and serves reads; then one of the
+/// originals is removed and shut down, and the cluster carries on.
+#[test]
+fn a_node_can_join_a_running_cluster_and_another_can_leave() {
+    let mut c = Cluster::start(3);
+    let leader = c.await_leader();
+    assert_eq!(c.command(leader, &[b"SET", b"before", b"1"]), Reply::ok());
+
+    c.join(4);
+    // Until it is added it is nobody's follower and stands for nothing.
+    assert_eq!(c.field(4, "members").as_deref(), Some(""));
+    let (raft, client) = (c.node(4).raft_addr.clone(), c.node(4).client_addr.clone());
+    assert_eq!(
+        c.command(
+            leader,
+            &[b"RAFT.ADD", b"4", raft.as_bytes(), client.as_bytes()]
+        ),
+        Reply::ok()
+    );
+    c.poll("the new node to catch up", || {
+        (c.field(4, "keys").as_deref() == Some("1")
+            && c.field(4, "members").as_deref() == Some("1,2,3,4"))
+        .then_some(())
+    });
+    assert_eq!(c.command(4, &[b"GET", b"before"]), bulk("1"));
+
+    let gone = c
+        .ids()
+        .into_iter()
+        .find(|&id| id != leader && id != 4)
+        .expect("an original follower");
+    assert_eq!(
+        c.command(leader, &[b"RAFT.REMOVE", gone.to_string().as_bytes()]),
+        Reply::ok()
+    );
+    c.kill(gone);
+
+    assert_eq!(c.command(leader, &[b"SET", b"after", b"2"]), Reply::ok());
+    let expected: Vec<String> = [1, 2, 3, 4]
+        .iter()
+        .filter(|&&id| id != gone)
+        .map(|id| id.to_string())
+        .collect();
+    let expected = expected.join(",");
+    for id in [leader, 4] {
+        c.poll(&format!("node {id} to hold both writes"), || {
+            (c.field(id, "keys").as_deref() == Some("2")
+                && c.field(id, "members").as_deref() == Some(expected.as_str()))
+            .then_some(())
+        });
     }
 }

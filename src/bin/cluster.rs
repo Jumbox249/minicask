@@ -18,7 +18,7 @@ const USAGE: &str = "\
 minicask-cluster - one node of a replicated key/value store
 
 USAGE:
-    minicask-cluster --id N --dir PATH --raft ADDR --client ADDR [--peer SPEC]...
+    minicask-cluster --id N --dir PATH --raft ADDR --client ADDR [--peer SPEC]... [--join]
 
 OPTIONS:
     --id N              This node's id, unique in the cluster
@@ -26,6 +26,10 @@ OPTIONS:
     --raft ADDR         Address to listen on for the other nodes
     --client ADDR       Address to listen on for Redis clients
     --peer SPEC         A peer, as ID@RAFT_ADDR,CLIENT_ADDR; repeat per peer
+    --join              Join a cluster that already exists, rather than
+                        starting a new one with the peers given. The node
+                        waits until a leader adds it:
+                            redis-cli -p LEADER RAFT.ADD ID RAFT_ADDR CLIENT_ADDR
     --tick-ms N         Milliseconds per consensus tick (default: 50)
     --snapshot-every N  Applied entries between snapshots, 0 for never
                         (default: 10000)
@@ -44,6 +48,7 @@ fn main() -> ExitCode {
     let mut peers = Vec::new();
     let mut tick_ms = 50u64;
     let mut snapshot_every = minicask::DEFAULT_SNAPSHOT_EVERY;
+    let mut join = false;
 
     while let Some(arg) = args.next() {
         let mut value = |what: &str| match args.next() {
@@ -70,6 +75,10 @@ fn main() -> ExitCode {
                     .map_err(|_| "--snapshot-every must be a number".to_string())
             }),
             "--peer" => value("--peer").and_then(|v| parse_peer(&v).map(|p| peers.push(p))),
+            "--join" => {
+                join = true;
+                Ok(())
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -96,6 +105,7 @@ fn main() -> ExitCode {
     let config = ClusterConfig {
         id,
         peers,
+        join,
         tick_ms,
         raft: Config::default(),
         snapshot_every,

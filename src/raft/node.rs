@@ -7,7 +7,7 @@
 //! harness partition a cluster and kill leaders without a single sleep.
 
 use super::log::{
-    Command, Entry, HardState, NodeId, SnapshotMeta, SnapshotSink, Storage, StorageExt,
+    Command, Entry, HardState, Member, NodeId, SnapshotMeta, SnapshotSink, Storage, StorageExt,
 };
 use super::message::{Action, Message};
 use crate::error::Result;
@@ -86,6 +86,8 @@ pub enum ProposeError {
     TooLarge { len: usize, max: usize },
     /// The entry could not be made durable, so it was not accepted.
     Storage(crate::Error),
+    /// A membership change this node will not start, and why.
+    Membership(&'static str),
 }
 
 impl std::fmt::Display for ProposeError {
@@ -102,6 +104,7 @@ impl std::fmt::Display for ProposeError {
                 )
             }
             ProposeError::Storage(e) => write!(f, "{e}"),
+            ProposeError::Membership(why) => write!(f, "{why}"),
         }
     }
 }
@@ -110,7 +113,9 @@ impl std::error::Error for ProposeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ProposeError::Storage(e) => Some(e),
-            ProposeError::NotLeader { .. } | ProposeError::TooLarge { .. } => None,
+            ProposeError::NotLeader { .. }
+            | ProposeError::TooLarge { .. }
+            | ProposeError::Membership(_) => None,
         }
     }
 }
@@ -196,6 +201,16 @@ impl Rng {
 
 pub struct Node<S: Storage> {
     id: NodeId,
+    /// The membership this node was started with, which counts only until
+    /// the log or a snapshot says otherwise.
+    bootstrap: Vec<Member>,
+    /// The membership in force: the newest in the log, committed or not,
+    /// and the index of the entry that set it (0 for the bootstrap).
+    members: Vec<Member>,
+    membership_index: u64,
+    /// Everyone whose vote counts, this node included if it is a member.
+    voters: Vec<NodeId>,
+    /// The voters other than this node: who it replicates to and canvasses.
     peers: Vec<NodeId>,
     config: Config,
     storage: S,
@@ -254,13 +269,35 @@ impl<S: Storage> Node<S> {
     /// A node always comes up as a follower. It keeps the term and the vote
     /// it had before, which is what stops a restart from being a second
     /// vote in the same term.
+    ///
+    /// `peers` is the membership to start with, this node included. It
+    /// counts until the log says otherwise, so on a restart it is ignored
+    /// if the membership has ever changed. A node joining a cluster that
+    /// already exists starts with no peers at all: it is then a member of
+    /// nothing, stands for nothing, and waits to hear from a leader.
     pub fn new(id: NodeId, peers: Vec<NodeId>, config: Config, storage: S) -> Node<S> {
+        let members = peers
+            .into_iter()
+            .map(|id| Member {
+                id,
+                context: Vec::new(),
+            })
+            .collect();
+        Node::with_members(id, members, config, storage)
+    }
+
+    /// As [`new`](Node::new), with a context for each member.
+    pub fn with_members(id: NodeId, bootstrap: Vec<Member>, config: Config, storage: S) -> Node<S> {
         let snapshot = storage.snapshot_meta().index;
         let mut rng = Rng::new(id);
         let election_timeout = random_timeout(&mut rng, &config);
-        Node {
+        let mut node = Node {
             id,
-            peers: peers.into_iter().filter(|&p| p != id).collect(),
+            bootstrap,
+            members: Vec::new(),
+            membership_index: 0,
+            voters: Vec::new(),
+            peers: Vec::new(),
             config,
             storage,
             role: Role::Follower,
@@ -286,11 +323,31 @@ impl<S: Storage> Node<S> {
             heartbeat_elapsed: 0,
             election_timeout,
             rng,
-        }
+        };
+        node.reload_membership();
+        node
     }
 
     pub fn id(&self) -> NodeId {
         self.id
+    }
+
+    /// The membership in force, newest first in the log whether or not it
+    /// has committed yet.
+    pub fn members(&self) -> &[Member] {
+        &self.members
+    }
+
+    /// The index of the entry that set the membership in force, or 0 if it
+    /// is still the one the node was started with. Moves whenever the
+    /// membership does, so it is cheap to watch.
+    pub fn membership_index(&self) -> u64 {
+        self.membership_index
+    }
+
+    /// Whether this node's vote counts, and so whether it may stand.
+    pub fn is_voter(&self) -> bool {
+        self.voters.contains(&self.id)
     }
 
     pub fn role(&self) -> Role {
@@ -425,6 +482,12 @@ impl<S: Storage> Node<S> {
     pub fn tick(&mut self) -> Result<Vec<Action>> {
         let mut actions = Vec::new();
         match self.role {
+            // A leader that has removed itself goes on leading until the
+            // change commits, since until then it may be needed to finish
+            // it, and then hands over.
+            Role::Leader if !self.is_voter() && self.commit_index >= self.membership_index => {
+                self.become_follower(self.term(), None)?;
+            }
             Role::Leader => {
                 self.heartbeat_elapsed += 1;
                 if self.heartbeat_elapsed >= self.config.heartbeat_ticks {
@@ -446,9 +509,9 @@ impl<S: Storage> Node<S> {
                 self.election_elapsed += 1;
                 if self.election_elapsed >= self.election_timeout {
                     self.active.insert(self.id);
-                    let reachable = self.active.len();
+                    let reachable = self.has_quorum(&self.active);
                     self.active.clear();
-                    if !self.has_majority(reachable) {
+                    if !reachable {
                         self.become_follower(self.term(), None)?;
                     } else {
                         self.election_elapsed = 0;
@@ -458,10 +521,17 @@ impl<S: Storage> Node<S> {
             Role::Follower | Role::PreCandidate | Role::Candidate => {
                 self.election_elapsed += 1;
                 if self.election_elapsed >= self.election_timeout {
-                    // Nobody is leading, or the last attempt was split, or
-                    // the question went unanswered. All three are answered
-                    // by asking again before running.
-                    self.become_pre_candidate(&mut actions)?;
+                    if self.is_voter() {
+                        // Nobody is leading, or the last attempt was split,
+                        // or the question went unanswered. All three are
+                        // answered by asking again before running.
+                        self.become_pre_candidate(&mut actions)?;
+                    } else {
+                        // Not a member, or not yet one: there is nothing to
+                        // stand for. Keep waiting to hear from a leader.
+                        self.role = Role::Follower;
+                        self.reset_election_timer();
+                    }
                 }
             }
         }
@@ -499,9 +569,11 @@ impl<S: Storage> Node<S> {
         let Some(term) = self.storage.term_at(index) else {
             return Ok(None);
         };
-        Ok(Some(
-            self.storage.new_snapshot(SnapshotMeta { index, term })?,
-        ))
+        let members = self.members_at(index);
+        Ok(Some(self.storage.new_snapshot(
+            SnapshotMeta { index, term },
+            Some(members),
+        )?))
     }
 
     /// Install a snapshot written from [`begin_compaction`](Node::begin_compaction)
@@ -526,7 +598,9 @@ impl<S: Storage> Node<S> {
     /// An ordinary timeout asks first, via [`Role::PreCandidate`].
     pub fn campaign(&mut self) -> Result<Vec<Action>> {
         let mut actions = Vec::new();
-        self.become_candidate(&mut actions)?;
+        if self.is_voter() {
+            self.become_candidate(&mut actions)?;
+        }
         Ok(actions)
     }
 
@@ -538,7 +612,9 @@ impl<S: Storage> Node<S> {
     /// asked.
     pub fn pre_vote(&mut self) -> Result<Vec<Action>> {
         let mut actions = Vec::new();
-        self.become_pre_candidate(&mut actions)?;
+        if self.is_voter() {
+            self.become_pre_candidate(&mut actions)?;
+        }
         Ok(actions)
     }
 
@@ -655,6 +731,7 @@ impl<S: Storage> Node<S> {
                 data,
                 done,
                 seq,
+                members,
                 ..
             } => self.handle_install_snapshot(
                 from,
@@ -666,6 +743,7 @@ impl<S: Storage> Node<S> {
                 data,
                 done,
                 seq,
+                members,
                 &mut actions,
             )?,
             Message::InstallSnapshotReply {
@@ -769,6 +847,65 @@ impl<S: Storage> Node<S> {
         Ok(Accepted { index, actions })
     }
 
+    /// Change the cluster's membership to `members`, which must differ from
+    /// the membership in force by at most one voter, added or removed.
+    ///
+    /// One at a time is what makes this safe without a joint consensus:
+    /// any majority of the old voters and any majority of the new ones
+    /// share a node, so the two can never elect a leader each. The new
+    /// membership takes effect on each node as soon as the entry reaches
+    /// its log, not when it commits, which is what the rule needs.
+    ///
+    /// Two more rules keep it sound. A change is refused while another is
+    /// still uncommitted, since two in flight at once can add up to more
+    /// than one voter. And a leader must first have committed an entry of
+    /// its own term: without that, a change it proposes can race one an
+    /// earlier leader left uncommitted, which is the bug in the original
+    /// single-server algorithm, fixed the way the dissertation's errata
+    /// fixes it.
+    ///
+    /// A leader that removes itself carries on until the change commits
+    /// and then stands down. A node that is added should be started with
+    /// no peers of its own, see [`new`](Node::new), and it catches up from
+    /// the leader like any follower that has fallen behind.
+    pub fn propose_membership(
+        &mut self,
+        members: Vec<Member>,
+    ) -> std::result::Result<Accepted, ProposeError> {
+        if self.role != Role::Leader {
+            return Err(ProposeError::NotLeader {
+                leader: self.leader_id,
+            });
+        }
+        if !self.ready_to_serve() {
+            return Err(ProposeError::Membership(
+                "this leader has not yet committed an entry of its own term",
+            ));
+        }
+        if self.membership_index > self.commit_index {
+            return Err(ProposeError::Membership(
+                "the last membership change has not committed yet",
+            ));
+        }
+        let old: HashSet<NodeId> = self.voters.iter().copied().collect();
+        let new: HashSet<NodeId> = members.iter().map(|m| m.id).collect();
+        if new.len() != members.len() {
+            return Err(ProposeError::Membership("a member is listed twice"));
+        }
+        if new.is_empty() {
+            return Err(ProposeError::Membership("a cluster cannot have no members"));
+        }
+        if old.symmetric_difference(&new).count() > 1 {
+            return Err(ProposeError::Membership(
+                "only one member can be added or removed at a time",
+            ));
+        }
+        let index = self.append_local(Command::Config(members))?;
+        let mut actions = Vec::new();
+        self.broadcast_append(&mut actions)?;
+        Ok(Accepted { index, actions })
+    }
+
     /// Entries that have been committed and not yet handed over. Applying
     /// them in this order on every node is what makes the state machines
     /// agree.
@@ -817,7 +954,7 @@ impl<S: Storage> Node<S> {
         self.votes.insert(self.id);
         self.reset_election_timer();
 
-        if self.has_majority(self.votes.len()) {
+        if self.has_quorum(&self.votes) {
             // A single-node cluster needs nobody's permission.
             return self.become_candidate(actions);
         }
@@ -873,7 +1010,7 @@ impl<S: Storage> Node<S> {
             // Only this round's answers count, and only while still asking.
             if self.role == Role::PreCandidate && term == self.term() + 1 {
                 self.votes.insert(from);
-                if self.has_majority(self.votes.len()) {
+                if self.has_quorum(&self.votes) {
                     // The cluster would have us. Now the term is worth it.
                     self.become_candidate(actions)?;
                 }
@@ -901,7 +1038,7 @@ impl<S: Storage> Node<S> {
         self.votes.insert(self.id);
         self.reset_election_timer();
 
-        if self.has_majority(self.votes.len()) {
+        if self.has_quorum(&self.votes) {
             // A single-node cluster. It is already decided.
             return self.become_leader(actions);
         }
@@ -997,7 +1134,7 @@ impl<S: Storage> Node<S> {
         }
         if granted {
             self.votes.insert(from);
-            if self.has_majority(self.votes.len()) {
+            if self.has_quorum(&self.votes) {
                 self.become_leader(actions)?;
             }
         }
@@ -1081,21 +1218,31 @@ impl<S: Storage> Node<S> {
         // The logs match up to `prev_log_index`, so anything the leader
         // sends from here is authoritative.
         let mut append_from = 0;
+        let mut membership_moved = false;
         for (offset, entry) in entries.iter().enumerate() {
             let index = prev_log_index + 1 + offset as u64;
             match self.storage.term_at(index) {
                 Some(t) if t == entry.term => append_from = offset + 1,
                 Some(_) => {
                     // A genuine conflict. Raft guarantees this entry was
-                    // never committed, so discarding it is safe.
+                    // never committed, so discarding it is safe. A
+                    // membership entry among what goes is undone with it.
                     self.storage.truncate_from(index)?;
+                    membership_moved = true;
                     break;
                 }
                 None => break,
             }
         }
         if append_from < entries.len() {
-            self.storage.append(&entries[append_from..])?;
+            let new = &entries[append_from..];
+            self.storage.append(new)?;
+            membership_moved |= new.iter().any(|e| matches!(e.command, Command::Config(_)));
+        }
+        if membership_moved {
+            // A membership takes effect as soon as it is in the log, and
+            // stops the moment it is not.
+            self.reload_membership();
         }
 
         // Note the index of the last entry *this message* covers, not the
@@ -1191,14 +1338,24 @@ impl<S: Storage> Node<S> {
     }
 
     fn maybe_commit(&mut self) {
-        // The median of the followers' progress, counting this node's own
-        // log, is the highest index a majority holds.
+        // The median of the voters' progress is the highest index a
+        // majority holds. This node's own log counts only if it is one of
+        // them: a leader that is removing itself replicates the change but
+        // no longer has a say in when it commits.
+        if self.voters.is_empty() {
+            return;
+        }
         let mut indices: Vec<u64> = self
-            .peers
+            .voters
             .iter()
-            .map(|p| self.match_index.get(p).copied().unwrap_or(0))
+            .map(|&v| {
+                if v == self.id {
+                    self.storage.last_index()
+                } else {
+                    self.match_index.get(&v).copied().unwrap_or(0)
+                }
+            })
             .collect();
-        indices.push(self.storage.last_index());
         indices.sort_unstable_by(|a, b| b.cmp(a));
         let majority = indices[self.quorum() - 1];
 
@@ -1251,6 +1408,7 @@ impl<S: Storage> Node<S> {
                     data,
                     done,
                     seq: self.seq,
+                    members: self.storage.snapshot_members(),
                 },
             });
         }
@@ -1317,14 +1475,17 @@ impl<S: Storage> Node<S> {
         (self.seq, index)
     }
 
-    /// Whether a majority, counting this node, has answered `seq` or later.
+    /// Whether a majority of the voters, counting this node, has answered
+    /// `seq` or later.
     fn round_confirmed(&self, seq: u64) -> bool {
-        let answered = self
+        let mut answered: HashSet<NodeId> = self
             .peers
             .iter()
+            .copied()
             .filter(|p| self.acked.get(p).is_some_and(|&a| a >= seq))
-            .count();
-        self.has_majority(answered + 1)
+            .collect();
+        answered.insert(self.id);
+        self.has_quorum(&answered)
     }
 
     fn handle_read_index(&mut self, from: NodeId, id: u64, actions: &mut Vec<Action>) {
@@ -1382,6 +1543,7 @@ impl<S: Storage> Node<S> {
         data: Vec<u8>,
         done: bool,
         seq: u64,
+        members: Option<Vec<Member>>,
         actions: &mut Vec<Action>,
     ) -> Result<()> {
         // As with `AppendEntries`: the term was checked in `step`, so this
@@ -1423,7 +1585,7 @@ impl<S: Storage> Node<S> {
                 return Ok(());
             }
             // Replacing an unfinished one drops it, and its part with it.
-            self.incoming = Some((from, self.storage.new_snapshot(meta)?));
+            self.incoming = Some((from, self.storage.new_snapshot(meta, members)?));
         }
 
         let (_, sink) = self.incoming.as_mut().expect("just ensured");
@@ -1443,6 +1605,8 @@ impl<S: Storage> Node<S> {
 
         let (_, sink) = self.incoming.take().expect("just used");
         self.storage.install_snapshot(sink)?;
+        // The entry that set the membership may be among those replaced.
+        self.reload_membership();
         // The snapshot is applied state, so the state machine must pick it
         // up rather than wait for entries that no longer exist.
         self.commit_index = self.commit_index.max(meta.index);
@@ -1490,11 +1654,15 @@ impl<S: Storage> Node<S> {
 
     fn append_local(&mut self, command: Command) -> Result<u64> {
         let index = self.storage.last_index() + 1;
+        let config = matches!(command, Command::Config(_));
         self.storage.append(&[Entry {
             term: self.term(),
             index,
             command,
         }])?;
+        if config {
+            self.reload_membership();
+        }
         // A one-node cluster commits the moment it appends, since it is
         // its own majority.
         self.maybe_commit();
@@ -1558,11 +1726,76 @@ impl<S: Storage> Node<S> {
     }
 
     fn quorum(&self) -> usize {
-        (self.peers.len() + 1) / 2 + 1
+        self.voters.len() / 2 + 1
     }
 
-    fn has_majority(&self, votes: usize) -> bool {
-        votes >= self.quorum()
+    /// Whether `ids` include a majority of the voters. Anyone else in there
+    /// does not count, and with no voters at all there is no majority.
+    fn has_quorum(&self, ids: &HashSet<NodeId>) -> bool {
+        let counted = self.voters.iter().filter(|v| ids.contains(v)).count();
+        !self.voters.is_empty() && counted >= self.quorum()
+    }
+
+    /// The membership in force as of `index`: the newest membership entry
+    /// at or before it, or the snapshot's, or the bootstrap.
+    fn members_at(&self, index: u64) -> Vec<Member> {
+        let mut members = self
+            .storage
+            .snapshot_members()
+            .unwrap_or_else(|| self.bootstrap.clone());
+        for i in self.storage.first_index()..=index.min(self.storage.last_index()) {
+            if let Some(Entry {
+                command: Command::Config(m),
+                ..
+            }) = self.storage.entry(i)
+            {
+                members = m.clone();
+            }
+        }
+        members
+    }
+
+    /// Work the membership out again from the log, after anything that can
+    /// have changed it: a membership entry appended, entries truncated, a
+    /// snapshot installed, a restart.
+    fn reload_membership(&mut self) {
+        let snapshot = self.storage.snapshot_meta().index;
+        let (mut members, mut at) = match self.storage.snapshot_members() {
+            Some(members) => (members, snapshot),
+            None => (self.bootstrap.clone(), 0),
+        };
+        for i in self.storage.first_index()..=self.storage.last_index() {
+            if let Some(Entry {
+                command: Command::Config(m),
+                ..
+            }) = self.storage.entry(i)
+            {
+                members = m.clone();
+                at = i;
+            }
+        }
+
+        let mut voters: Vec<NodeId> = members.iter().map(|m| m.id).collect();
+        voters.sort_unstable();
+        voters.dedup();
+        self.peers = voters.iter().copied().filter(|&v| v != self.id).collect();
+        self.voters = voters;
+        self.members = members;
+        self.membership_index = at;
+
+        if self.role == Role::Leader {
+            // A new peer is found out about the usual way: offered the
+            // log from its end, and rewound from its first refusal.
+            let next = self.storage.last_index() + 1;
+            for &peer in &self.peers {
+                self.next_index.entry(peer).or_insert(next);
+                self.match_index.entry(peer).or_insert(0);
+            }
+            let peers = &self.peers;
+            self.next_index.retain(|p, _| peers.contains(p));
+            self.match_index.retain(|p, _| peers.contains(p));
+            self.snapshot_progress.retain(|p, _| peers.contains(p));
+        }
     }
 
     fn reset_election_timer(&mut self) {
@@ -1858,6 +2091,7 @@ mod tests {
         let mut node = follower(5, &[(1, 5), (2, 5)]);
         // Five nodes, so two matching followers plus the leader is three
         // of five, a majority; one plus the leader is not.
+        node.voters = vec![1, 2, 3, 4, 5];
         node.peers = vec![2, 3, 4, 5];
         node.leader_with(&[(2, 2), (3, 0), (4, 0), (5, 0)]);
 
@@ -2177,6 +2411,7 @@ mod tests {
             data: data.to_vec(),
             done,
             seq: 0,
+            members: None,
         }
     }
 
@@ -2374,6 +2609,158 @@ mod tests {
             "no newer than what is there"
         );
         assert_eq!(node.storage().first_index(), 3);
+    }
+
+    // -- membership -----------------------------------------------------
+
+    fn member(id: NodeId) -> Member {
+        Member {
+            id,
+            context: Vec::new(),
+        }
+    }
+
+    /// A leader that has not committed an entry of its own term may not
+    /// change the membership: a change an earlier leader left uncommitted
+    /// may still be in flight, and two together can be more than one.
+    #[test]
+    fn a_new_leader_waits_for_its_noop_before_changing_membership() {
+        let mut node = follower(1, &[(1, 1)]);
+        node.campaign().unwrap();
+        node.step(
+            2,
+            Message::RequestVoteReply {
+                term: 2,
+                granted: true,
+            },
+        )
+        .unwrap();
+        assert!(node.is_leader() && !node.ready_to_serve());
+        let change = vec![member(1), member(2), member(3), member(4)];
+        assert!(matches!(
+            node.propose_membership(change.clone()),
+            Err(ProposeError::Membership(_))
+        ));
+
+        node.step(2, ack_matching(2, 2)).unwrap();
+        assert!(node.ready_to_serve());
+        assert!(node.propose_membership(change).is_ok());
+        assert_eq!(node.members().len(), 4, "in force as soon as it is logged");
+    }
+
+    fn ack_matching(term: u64, match_index: u64) -> Message {
+        Message::AppendEntriesReply {
+            term,
+            success: true,
+            match_index,
+            conflict_index: 0,
+            conflict_term: None,
+            seq: 0,
+        }
+    }
+
+    /// A node with no membership stands for nothing, however long it waits.
+    #[test]
+    fn a_node_that_belongs_to_nothing_never_stands() {
+        let mut node = Node::new(4, Vec::new(), Config::default(), MemStorage::new());
+        for _ in 0..200 {
+            let actions = node.tick().unwrap();
+            assert!(
+                actions.is_empty(),
+                "it asked someone something: {actions:?}"
+            );
+        }
+        assert_eq!(node.role(), Role::Follower);
+        assert!(node.campaign().unwrap().is_empty());
+        assert!(node.pre_vote().unwrap().is_empty());
+    }
+
+    /// Votes from outside the membership do not count towards a majority.
+    #[test]
+    fn a_vote_from_a_non_member_does_not_count() {
+        let mut node = follower(1, &[]);
+        node.campaign().unwrap();
+        node.step(
+            9,
+            Message::RequestVoteReply {
+                term: 2,
+                granted: true,
+            },
+        )
+        .unwrap();
+        assert!(!node.is_leader(), "elected on the vote of a stranger");
+        node.step(
+            2,
+            Message::RequestVoteReply {
+                term: 2,
+                granted: true,
+            },
+        )
+        .unwrap();
+        assert!(node.is_leader());
+    }
+
+    /// A snapshot records the membership as of its index, and a node that
+    /// installs one takes it on.
+    #[test]
+    fn a_snapshot_carries_the_membership() {
+        let mut node = follower(1, &[(1, 1)]);
+        node.step(2, append(1, (1, 1), &[], 1)).unwrap();
+        let members = vec![member(1), member(2), member(3), member(7)];
+        let message = Message::InstallSnapshot {
+            term: 1,
+            last_index: 5,
+            last_term: 1,
+            offset: 0,
+            data: b"state".to_vec(),
+            done: true,
+            seq: 0,
+            members: Some(members.clone()),
+        };
+        node.step(2, message).unwrap();
+        assert_eq!(node.members(), members.as_slice());
+        assert_eq!(node.storage().snapshot_members(), Some(members));
+    }
+
+    /// Once the entry that changed the membership has been compacted away,
+    /// the snapshot is the only record of it. A restart must take the
+    /// membership from there, not from the peers the node was started with.
+    #[test]
+    fn a_membership_compacted_out_of_the_log_survives_a_restart() {
+        let mut node = follower(1, &[]);
+        let config = Entry {
+            term: 1,
+            index: 2,
+            command: Command::Config(vec![member(1), member(2), member(3), member(4)]),
+        };
+        let message = Message::AppendEntries {
+            term: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![
+                Entry {
+                    term: 1,
+                    index: 1,
+                    command: Command::Noop,
+                },
+                config,
+            ],
+            leader_commit: 2,
+            seq: 0,
+        };
+        node.step(2, message).unwrap();
+        assert_eq!(node.members().len(), 4);
+        node.take_committed();
+        assert!(node.compact(2, b"state").unwrap());
+
+        let storage = node.into_storage();
+        let node = Node::new(1, vec![1, 2, 3], Config::default(), storage);
+        let ids: Vec<NodeId> = node.members().iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4],
+            "the restart forgot the fourth member"
+        );
     }
 
     // -- reads ----------------------------------------------------------
