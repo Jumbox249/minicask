@@ -112,6 +112,8 @@ pub struct Store {
     active_hints: Vec<HintEntry>,
     /// Bytes of data files read at open, which the hints exist to keep low.
     scanned_at_open: u64,
+    /// A background compaction is out; see [`Store::begin_compaction`].
+    compacting: bool,
 }
 
 impl Store {
@@ -138,6 +140,15 @@ impl Store {
 
         let file_ids = list_data_files(&dir)?;
         let newest = file_ids.last().copied();
+
+        // A merge that was still being written when the process stopped. It
+        // was never renamed into place, so nothing depends on it.
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.to_string_lossy().ends_with(".log.part") {
+                std::fs::remove_file(path)?;
+            }
+        }
 
         // A hint whose data file is gone was left by a crash in the middle
         // of deleting what a compaction replaced.
@@ -248,6 +259,7 @@ impl Store {
             sealed_synced: HashMap::new(),
             active_hints,
             scanned_at_open,
+            compacting: false,
         })
     }
 
@@ -485,6 +497,9 @@ impl Store {
     /// crash partway through leaves the old files untouched and the next
     /// startup simply ignores the incomplete merge.
     pub fn compact(&mut self) -> Result<CompactReport> {
+        if self.compacting {
+            return Err(compaction_in_progress());
+        }
         // The merge reads records back out of the files, so none of them
         // can still be sitting in the writer's buffer.
         self.writer.flush()?;
@@ -571,6 +586,96 @@ impl Store {
         })
     }
 
+    /// The first half of a compaction that runs without the store: the rest
+    /// is [`CompactionJob::run`], on any thread, then
+    /// [`finish_compaction`](Store::finish_compaction) back here.
+    ///
+    /// The active file is sealed and writing moves to a new one, two ids
+    /// on, leaving the id between them for the merged file. Everything the
+    /// merge reads is in files that will not change again, and everything
+    /// written while it runs lands in a file that replays after the merged
+    /// one, so a write made meanwhile always wins over the copy the merge
+    /// made of what it replaced.
+    pub(crate) fn begin_compaction(&mut self) -> Result<CompactionJob> {
+        if self.compacting {
+            return Err(compaction_in_progress());
+        }
+        // Seal the active file exactly as a rollover would.
+        self.writer.sync()?;
+        let sealed = self.writer.file_id;
+        self.sealed_synced.insert(sealed, self.writer.synced);
+        let hints = std::mem::take(&mut self.active_hints);
+        let _ = hint::write(&self.dir, sealed, self.writer.offset, &hints);
+
+        let old_ids: Vec<u64> = self.readers.keys().copied().collect();
+        let old_bytes = self.disk_bytes;
+        let merged_id = sealed + 1;
+        self.writer = LogWriter::open(&self.dir, sealed + 2)?;
+        self.readers.insert(
+            sealed + 2,
+            File::open(data_file_path(&self.dir, sealed + 2))?,
+        );
+
+        let view = self.view()?;
+        self.compacting = true;
+        Ok(CompactionJob {
+            dir: self.dir.clone(),
+            view,
+            merged_id,
+            old_ids,
+            old_bytes,
+        })
+    }
+
+    /// Install a merge written by a [`CompactionJob`]: point every key the
+    /// merge copied at its copy, unless it has been written since, and
+    /// delete the files the merge replaced.
+    pub(crate) fn finish_compaction(&mut self, merged: MergedFile) -> Result<CompactReport> {
+        self.compacting = false;
+        let files_before = self.readers.len();
+        self.readers
+            .insert(merged.id, File::open(data_file_path(&self.dir, merged.id))?);
+        self.sealed_synced.insert(merged.id, merged.bytes);
+        for (key, old, new) in merged.moved {
+            // A key written or deleted since the merge began points
+            // somewhere newer than the record the merge copied, or nowhere.
+            // Its copy is dead on arrival and stays that way.
+            if let Some(loc) = self.keydir.get_mut(&key) {
+                if *loc == old {
+                    *loc = new;
+                }
+            }
+        }
+        // The copies are the same bytes as the records they replace, so
+        // what is live does not change; what is on disk loses everything
+        // in the old files and gains the merged file.
+        for id in &merged.old_ids {
+            self.readers.remove(id);
+            self.sealed_synced.remove(id);
+            let hint = hint::hint_path(&self.dir, *id);
+            if hint.exists() {
+                std::fs::remove_file(hint)?;
+            }
+            let path = data_file_path(&self.dir, *id);
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        let before = self.disk_bytes;
+        self.disk_bytes = self.disk_bytes - merged.old_bytes + merged.bytes;
+        Ok(CompactReport {
+            files_before,
+            bytes_before: before,
+            bytes_after: self.disk_bytes,
+        })
+    }
+
+    /// Give up on a background compaction that failed, so that another can
+    /// be tried. Nothing was replaced, so there is nothing to undo.
+    pub(crate) fn abandon_compaction(&mut self) {
+        self.compacting = false;
+    }
+
     /// The store as it stands right now, readable without the store.
     ///
     /// This works because nothing on disk is ever overwritten: a write
@@ -634,6 +739,93 @@ impl SyncHandle {
     pub(crate) fn sync(self) -> Result<(u64, u64)> {
         self.file.sync_data()?;
         Ok(self.point)
+    }
+}
+
+fn compaction_in_progress() -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "a compaction is already in progress",
+    ))
+}
+
+/// A compaction running without the store. See [`Store::begin_compaction`].
+pub(crate) struct CompactionJob {
+    dir: PathBuf,
+    view: StoreView,
+    merged_id: u64,
+    old_ids: Vec<u64>,
+    old_bytes: u64,
+}
+
+/// What a finished [`CompactionJob`] wrote: the merged file, and for each
+/// key it copied, where the record was and where its copy is.
+pub(crate) struct MergedFile {
+    id: u64,
+    bytes: u64,
+    old_ids: Vec<u64>,
+    old_bytes: u64,
+    moved: Vec<(Vec<u8>, Location, Location)>,
+}
+
+impl CompactionJob {
+    /// Copy every record the view holds into the merged file. Written under
+    /// another name, synced, and only then renamed into place, so a crash
+    /// part way leaves nothing a restart would read; once it is in place,
+    /// replaying it along with the files it came from gives the same store.
+    pub(crate) fn run(self) -> Result<MergedFile> {
+        let part = self.dir.join(format!("{:010}.log.part", self.merged_id));
+        let mut file = std::io::BufWriter::with_capacity(
+            1024 * 1024,
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&part)?,
+        );
+        let mut offset = 0u64;
+        let mut moved = Vec::with_capacity(self.view.entries.len());
+        let mut hints = Vec::with_capacity(self.view.entries.len());
+        for (key, loc) in &self.view.entries {
+            let file_handle = self.view.readers.get(&loc.file_id).ok_or(Error::Corrupt {
+                file_id: loc.file_id,
+                offset: loc.offset,
+                detail: "index points at a data file that is not open",
+            })?;
+            // Verbatim, so each copy keeps its checksum and timestamp, and
+            // checked on the way, so rot is not copied into the merge.
+            let bytes = log::read_at(file_handle, loc.offset, loc.len)?;
+            decode_value(&bytes, loc)?;
+            std::io::Write::write_all(&mut file, &bytes)?;
+            let new = Location {
+                file_id: self.merged_id,
+                offset,
+                len: loc.len,
+                tstamp: loc.tstamp,
+            };
+            hints.push(HintEntry {
+                key: key.clone(),
+                offset,
+                len: loc.len,
+                tstamp: loc.tstamp,
+                tombstone: false,
+            });
+            moved.push((key.clone(), *loc, new));
+            offset += loc.len as u64;
+        }
+        let file = file.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&part, data_file_path(&self.dir, self.merged_id))?;
+        log::sync_dir(&self.dir)?;
+        let _ = hint::write(&self.dir, self.merged_id, offset, &hints);
+        Ok(MergedFile {
+            id: self.merged_id,
+            bytes: offset,
+            old_ids: self.old_ids,
+            old_bytes: self.old_bytes,
+            moved,
+        })
     }
 }
 
@@ -706,4 +898,152 @@ fn truncate_at(dir: &Path, file_id: u64, offset: u64) -> Result<()> {
     file.set_len(offset)?;
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "minicask-bg-compact-{label}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    fn contents(store: &Store) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut keys: Vec<Vec<u8>> = store.keys().map(<[u8]>::to_vec).collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|k| {
+                let v = store.get(&k).unwrap().unwrap();
+                (k, v)
+            })
+            .collect()
+    }
+
+    /// A store full of overwrites, and some keys that later writes touch.
+    fn fragmented(dir: &Path) -> Store {
+        let mut store = Store::open(dir).unwrap();
+        for round in 0..20 {
+            for i in 0..30 {
+                store
+                    .put(
+                        format!("k{i:02}").as_bytes(),
+                        format!("r{round}").as_bytes(),
+                    )
+                    .unwrap();
+            }
+        }
+        store
+    }
+
+    /// The point of a background compaction: the store keeps taking writes
+    /// while the merge runs, and none of them is lost or undone when the
+    /// merge is installed, not even one to a key the merge copied.
+    #[test]
+    fn writes_made_while_a_compaction_runs_win_over_its_copies() {
+        let dir = temp("writes-meanwhile");
+        let mut store = fragmented(&dir);
+        let job = store.begin_compaction().unwrap();
+
+        store.put(b"k00", b"written during the merge").unwrap();
+        store.delete(b"k01").unwrap();
+        store.put(b"new", b"added during the merge").unwrap();
+        assert!(store.compact().is_err(), "a second compaction started");
+
+        let merged = job.run().unwrap();
+        store
+            .put(b"k02", b"written after the merge, before install")
+            .unwrap();
+        let report = store.finish_compaction(merged).unwrap();
+        assert!(report.reclaimed_bytes() > 0);
+
+        let expect = |store: &Store| {
+            assert_eq!(
+                store.get(b"k00").unwrap(),
+                Some(b"written during the merge".to_vec())
+            );
+            assert_eq!(store.get(b"k01").unwrap(), None);
+            assert_eq!(
+                store.get(b"k02").unwrap(),
+                Some(b"written after the merge, before install".to_vec())
+            );
+            assert_eq!(store.get(b"k03").unwrap(), Some(b"r19".to_vec()));
+            assert_eq!(
+                store.get(b"new").unwrap(),
+                Some(b"added during the merge".to_vec())
+            );
+            assert_eq!(store.len(), 30);
+        };
+        expect(&store);
+        let stats = store.stats();
+        let live = stats.live_bytes;
+        assert!(stats.fragmentation() < 0.2, "{:?}", stats);
+        let before = contents(&store);
+        drop(store);
+
+        let store = Store::open(&dir).unwrap();
+        expect(&store);
+        assert_eq!(contents(&store), before);
+        assert_eq!(store.stats().live_bytes, live);
+        assert_eq!(store.stats(), {
+            let verified = Store::open_with(
+                &dir,
+                Options {
+                    verify_on_open: true,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            verified.stats()
+        });
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash after the merged file is in place but before it is installed
+    /// leaves the old files beside it. Replaying all of them gives the same
+    /// store, since the merge only holds copies.
+    #[test]
+    fn a_crash_before_the_merge_is_installed_loses_nothing() {
+        let dir = temp("crash-before-install");
+        let mut store = fragmented(&dir);
+        let job = store.begin_compaction().unwrap();
+        store.put(b"k05", b"meanwhile").unwrap();
+        let _merged = job.run().unwrap();
+        let before = contents(&store);
+        drop(store);
+
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(contents(&store), before);
+        assert_eq!(store.get(b"k05").unwrap(), Some(b"meanwhile".to_vec()));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A merge still being written when the process stopped is thrown away.
+    #[test]
+    fn an_unfinished_merge_is_removed_on_open() {
+        let dir = temp("unfinished-merge");
+        let mut store = fragmented(&dir);
+        let before = contents(&store);
+        let job = store.begin_compaction().unwrap();
+        drop(store);
+        let part = dir.join(format!("{:010}.log.part", job.merged_id));
+        std::fs::write(&part, b"half a merge").unwrap();
+        drop(job);
+
+        let store = Store::open(&dir).unwrap();
+        assert!(!part.exists());
+        assert_eq!(contents(&store), before);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

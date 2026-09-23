@@ -468,13 +468,20 @@ impl ClusterNode {
 fn ticker(shared: &Arc<Shared>, tick: Duration) {
     loop {
         thread::sleep(tick);
-        let (actions, job) = {
+        let (actions, job, compaction) = {
             let mut replica = shared.lock();
             let actions = match replica.tick() {
                 Ok(actions) => actions,
                 Err(e) => storage_failed(&e),
             };
             shared.follow_membership(&replica);
+            let compaction = match replica.start_compaction() {
+                Ok(job) => job,
+                Err(e) => {
+                    eprintln!("minicask-cluster: could not start compacting the store: {e}");
+                    None
+                }
+            };
             let job = match replica.start_snapshot() {
                 Ok(job) => job,
                 Err(e) => {
@@ -484,10 +491,20 @@ fn ticker(shared: &Arc<Shared>, tick: Duration) {
                     None
                 }
             };
-            (actions, job)
+            (actions, job, compaction)
         };
         shared.changed();
         shared.dispatch(actions);
+
+        if let Some(job) = compaction {
+            let worker = Arc::clone(shared);
+            let spawned = thread::Builder::new()
+                .name("compaction".to_string())
+                .spawn(move || compact_store(&worker, job));
+            if spawned.is_err() {
+                shared.lock().abandon_compaction();
+            }
+        }
 
         if let Some(job) = job {
             let writer = Arc::clone(shared);
@@ -517,6 +534,24 @@ fn write_snapshot(shared: &Shared, job: crate::replicated::SnapshotJob<crate::ra
         Err(e) => {
             eprintln!("minicask-cluster: writing the snapshot at {index} failed: {e}");
             replica.abandon_snapshot();
+        }
+    }
+}
+
+/// Merge the store's files without the lock, then take it just long enough
+/// to point the index at the merge.
+fn compact_store(shared: &Shared, job: crate::replicated::CompactionJob) {
+    let merged = job.run();
+    let mut replica = shared.lock();
+    match merged {
+        Ok(done) => {
+            if let Err(e) = replica.finish_compaction(done) {
+                storage_failed(&e);
+            }
+        }
+        Err(e) => {
+            eprintln!("minicask-cluster: compacting the store failed: {e}");
+            replica.abandon_compaction();
         }
     }
 }

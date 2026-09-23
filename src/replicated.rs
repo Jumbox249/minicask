@@ -127,6 +127,24 @@ pub struct ReplicatedStore<S: Storage> {
     background_snapshots: bool,
     /// A snapshot job is out and has not been finished or abandoned.
     snapshotting: bool,
+    /// The last snapshot found the store more than half dead records, and
+    /// in background mode the caller has not compacted it yet.
+    compaction_due: bool,
+}
+
+/// A compaction of the store running without the replica. See
+/// [`ReplicatedStore::start_compaction`].
+pub struct CompactionJob(crate::store::CompactionJob);
+
+/// A finished [`CompactionJob`], to hand back to
+/// [`ReplicatedStore::finish_compaction`].
+pub struct CompactedStore(crate::store::MergedFile);
+
+impl CompactionJob {
+    /// Write the merged file. Needs no access to the replica.
+    pub fn run(self) -> Result<CompactedStore> {
+        self.0.run().map(CompactedStore)
+    }
 }
 
 /// A snapshot being taken: the store as of one applied index, and the sink
@@ -178,6 +196,7 @@ impl<S: Storage> ReplicatedStore<S> {
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
             background_snapshots: false,
             snapshotting: false,
+            compaction_due: false,
         };
         if replica.snapshot_index() > replica.applied {
             replica.restore()?;
@@ -240,10 +259,41 @@ impl<S: Storage> ReplicatedStore<S> {
             // cluster nothing else ever compacts it. The moment the log is
             // compacted is the natural moment to compact the store too.
             if self.store.stats().fragmentation() > 0.5 {
-                self.store.compact()?;
+                if self.background_snapshots {
+                    self.compaction_due = true;
+                } else {
+                    self.store.compact()?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Begin compacting the store, if the last snapshot found it worth it.
+    ///
+    /// Only in background mode; see
+    /// [`set_background_snapshots`](Self::set_background_snapshots). Like
+    /// a snapshot job, the expensive part runs anywhere, and the replica
+    /// carries on applying and serving meanwhile: writes made while it
+    /// runs land in a file that replays after the merge.
+    pub fn start_compaction(&mut self) -> Result<Option<CompactionJob>> {
+        if !self.compaction_due {
+            return Ok(None);
+        }
+        self.compaction_due = false;
+        self.store
+            .begin_compaction()
+            .map(|job| Some(CompactionJob(job)))
+    }
+
+    /// Install a finished compaction.
+    pub fn finish_compaction(&mut self, done: CompactedStore) -> Result<()> {
+        self.store.finish_compaction(done.0).map(|_| ())
+    }
+
+    /// Give up on a compaction that failed; the next snapshot tries again.
+    pub fn abandon_compaction(&mut self) {
+        self.store.abandon_compaction();
     }
 
     /// Give up on a job that failed, so that another can be started.
@@ -1003,6 +1053,50 @@ mod tests {
                 "{key} is below the applied index but the power cut took it"
             );
         }
+        drop(replica);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// In background mode a snapshot that finds the store mostly dead does
+    /// not compact it there and then, under the caller's lock; it leaves a
+    /// job, and the replica carries on applying while the job runs.
+    #[test]
+    fn a_background_compaction_runs_while_the_replica_applies() {
+        let (path, store) = temp_store("background-compaction");
+        let mut replica = single_node(store);
+        replica.set_background_snapshots(true);
+        replica.set_snapshot_every(40);
+        for round in 0..10 {
+            for key in ["a", "b", "c", "d"] {
+                put_and_apply(&mut replica, key, &format!("{round}"));
+            }
+        }
+        let job = replica
+            .start_snapshot()
+            .unwrap()
+            .expect("a snapshot is due");
+        let sink = job.run().unwrap();
+        replica.finish_snapshot(sink).unwrap();
+        let before = replica.store().stats();
+        assert!(before.fragmentation() > 0.5, "{before:?}");
+
+        let compaction = replica
+            .start_compaction()
+            .unwrap()
+            .expect("a compaction is due");
+        assert!(
+            replica.start_compaction().unwrap().is_none(),
+            "two were started"
+        );
+        put_and_apply(&mut replica, "a", "during");
+        let merged = compaction.run().unwrap();
+        put_and_apply(&mut replica, "e", "after");
+        replica.finish_compaction(merged).unwrap();
+
+        assert!(replica.store().stats().disk_bytes < before.disk_bytes);
+        assert_eq!(replica.get(b"a").unwrap(), Some(b"during".to_vec()));
+        assert_eq!(replica.get(b"b").unwrap(), Some(b"9".to_vec()));
+        assert_eq!(replica.get(b"e").unwrap(), Some(b"after".to_vec()));
         drop(replica);
         let _ = std::fs::remove_dir_all(&path);
     }
