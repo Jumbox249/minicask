@@ -507,7 +507,8 @@ fn a_node_can_join_a_running_cluster_and_another_can_leave() {
     );
     c.poll("the new node to catch up", || {
         (c.field(4, "keys").as_deref() == Some("1")
-            && c.field(4, "members").as_deref() == Some("1,2,3,4"))
+            && c.field(4, "members").as_deref() == Some("1,2,3,4")
+            && c.field(4, "voters").as_deref() == Some("1,2,3,4"))
         .then_some(())
     });
     assert_eq!(c.command(4, &[b"GET", b"before"]), bulk("1"));

@@ -35,14 +35,39 @@ pub struct Member {
     /// so that the membership and the means of reaching it change together,
     /// in one entry.
     pub context: Vec<u8>,
+    /// A learner is sent the log like any follower but has no vote: it
+    /// counts towards no majority and never stands. A node joins as one, so
+    /// that it can be caught up without the cluster depending on it, and is
+    /// promoted once it has.
+    pub learner: bool,
 }
 
-/// Members as bytes: a count, then each id and its context, length first.
+impl Member {
+    pub fn voter(id: NodeId, context: Vec<u8>) -> Member {
+        Member {
+            id,
+            context,
+            learner: false,
+        }
+    }
+
+    pub fn learner(id: NodeId, context: Vec<u8>) -> Member {
+        Member {
+            id,
+            context,
+            learner: true,
+        }
+    }
+}
+
+/// Members as bytes: a count, then each id, a flags byte, and its
+/// context, length first.
 pub fn encode_members(members: &[Member]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(members.len() as u32).to_le_bytes());
     for member in members {
         out.extend_from_slice(&member.id.to_le_bytes());
+        out.push(u8::from(member.learner));
         out.extend_from_slice(&(member.context.len() as u32).to_le_bytes());
         out.extend_from_slice(&member.context);
     }
@@ -59,17 +84,26 @@ pub fn decode_members(bytes: &[u8]) -> Option<Vec<Member>> {
         Some(slice)
     };
     let count = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
-    // Each member is at least twelve bytes, so a count beyond that is a
+    // Each member is at least thirteen bytes, so a count beyond that is a
     // lie, and believing it would allocate for nothing.
-    if count > bytes.len() / 12 {
+    if count > bytes.len() / 13 {
         return None;
     }
     let mut members = Vec::with_capacity(count);
     for _ in 0..count {
         let id = u64::from_le_bytes(take(8)?.try_into().ok()?);
+        let learner = match take(1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
         let len = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
         let context = take(len)?.to_vec();
-        members.push(Member { id, context });
+        members.push(Member {
+            id,
+            context,
+            learner,
+        });
     }
     (at == bytes.len()).then_some(members)
 }
@@ -760,14 +794,8 @@ mod member_tests {
     #[test]
     fn members_round_trip() {
         let members = vec![
-            Member {
-                id: 1,
-                context: b"127.0.0.1:7001 127.0.0.1:6001".to_vec(),
-            },
-            Member {
-                id: u64::MAX - 1,
-                context: Vec::new(),
-            },
+            Member::voter(1, b"127.0.0.1:7001 127.0.0.1:6001".to_vec()),
+            Member::learner(u64::MAX - 1, Vec::new()),
         ];
         assert_eq!(decode_members(&encode_members(&members)), Some(members));
         assert_eq!(decode_members(&encode_members(&[])), Some(Vec::new()));
@@ -775,10 +803,7 @@ mod member_tests {
 
     #[test]
     fn garbage_is_not_a_membership() {
-        let bytes = encode_members(&[Member {
-            id: 3,
-            context: b"x".to_vec(),
-        }]);
+        let bytes = encode_members(&[Member::voter(3, b"x".to_vec())]);
         assert_eq!(decode_members(&bytes[..bytes.len() - 1]), None);
         let mut longer = bytes.clone();
         longer.push(0);

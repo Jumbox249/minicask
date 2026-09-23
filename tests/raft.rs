@@ -213,11 +213,16 @@ impl Cluster {
     fn change_membership(&mut self, leader: NodeId, ids: &[NodeId]) -> Result<u64, ProposeError> {
         let members = ids
             .iter()
-            .map(|&id| Member {
-                id,
-                context: Vec::new(),
-            })
+            .map(|&id| Member::voter(id, Vec::new()))
             .collect();
+        self.propose_members(leader, members)
+    }
+
+    fn propose_members(
+        &mut self,
+        leader: NodeId,
+        members: Vec<Member>,
+    ) -> Result<u64, ProposeError> {
         match self.slots.get_mut(&leader) {
             Some(Slot::Running(node)) => {
                 let accepted = node.propose_membership(members)?;
@@ -226,6 +231,18 @@ impl Cluster {
             }
             _ => panic!("node {leader} is not running"),
         }
+    }
+
+    fn voters_of(&self, id: NodeId) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self
+            .node(id)
+            .members()
+            .iter()
+            .filter(|m| !m.learner)
+            .map(|m| m.id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     fn voters(&self, id: NodeId) -> Vec<NodeId> {
@@ -1502,6 +1519,10 @@ fn a_removed_follower_is_left_behind_and_never_leads() {
     let gone = c.ids.iter().copied().find(|&id| id != leader).expect("one");
     let keep: Vec<NodeId> = c.ids.iter().copied().filter(|&id| id != gone).collect();
 
+    // Nothing in flight, so no reply from the node being removed can prompt
+    // the leader into sending it the removal by accident.
+    c.tick_n(5);
+    c.drop_inflight();
     let change = c.change_membership(leader, &keep).expect("accepted");
     c.run_until("the removal to commit on the rest", |c| {
         keep.iter().all(|&id| c.committed_on(id) >= change)
@@ -1512,11 +1533,7 @@ fn a_removed_follower_is_left_behind_and_never_leads() {
         keep.iter().all(|&id| c.committed_on(id) >= after)
     });
 
-    // The leader stops sending to the removed node the moment the change
-    // is in its log, so the node never hears that it was removed, and in
-    // time it asks to stand. Pre-vote and the leader lease are what make
-    // that harmless: nobody who hears from the leader says yes, so the
-    // node never leads and the leader's term never moves.
+    // Nothing the removed node does may disturb the others.
     for _ in 0..300 {
         c.tick();
         assert_ne!(c.node(gone).role(), Role::Leader);
@@ -1527,6 +1544,10 @@ fn a_removed_follower_is_left_behind_and_never_leads() {
         "the removed node unseated the leader"
     );
     assert_eq!(c.node(leader).term(), term);
+    // The leader kept sending to it until the removal committed, so it
+    // has the entry that removed it, knows it is out, and never stood.
+    assert!(!c.node(gone).is_member(), "the removed node never heard");
+    assert_eq!(c.node(gone).role(), Role::Follower);
 }
 
 /// A leader can remove itself. It sees the change through, then stands
@@ -1650,4 +1671,46 @@ fn a_restarted_node_keeps_its_membership() {
         c.restart(id);
         assert_eq!(c.voters(id), vec![1, 2, 3, 4], "node {id} after a restart");
     }
+}
+
+/// A node joins as a learner: sent the log, counted towards nothing. The
+/// leader promotes it once it holds everything committed, and not before,
+/// so the cluster never depends on a vote that is still catching up.
+#[test]
+fn a_learner_is_caught_up_before_it_is_promoted() {
+    let mut c = Cluster::new(3);
+    let leader = settled_leader(&mut c);
+    for i in 0..20u8 {
+        c.propose(leader, &[b'l', i]);
+    }
+    c.start_joining(4);
+    // Cut the learner off before it can catch up.
+    c.partition(&[&[1, 2, 3], &[4]]);
+    let mut members: Vec<Member> = (1..=3).map(|id| Member::voter(id, Vec::new())).collect();
+    members.push(Member::learner(4, Vec::new()));
+    let change = c.propose_members(leader, members).expect("accepted");
+    c.run_until("the learner to be added", |c| {
+        c.committed_on(leader) >= change
+    });
+
+    for _ in 0..60 {
+        c.tick();
+        assert_eq!(
+            c.voters_of(leader),
+            vec![1, 2, 3],
+            "a learner that has caught up on nothing was promoted"
+        );
+    }
+    // Three voters, so the two others are still a majority without it.
+    let write = c.propose(leader, b"without the learner");
+    c.run_until("a write to commit without the learner", |c| {
+        c.committed_on(leader) >= write
+    });
+
+    c.heal();
+    c.run_until("the learner to be caught up and promoted", |c| {
+        (1..=4).all(|id| c.voters_of(id) == vec![1, 2, 3, 4])
+    });
+    assert_eq!(c.applied_data(4), c.applied_data(leader));
+    c.assert_logs_agree();
 }

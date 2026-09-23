@@ -1173,6 +1173,7 @@ mod tests {
             .map(|&id| Member {
                 id,
                 context: format!("node-{id}").into_bytes(),
+                learner: false,
             })
             .collect()
     }

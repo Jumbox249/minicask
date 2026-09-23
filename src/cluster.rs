@@ -375,6 +375,7 @@ impl ClusterNode {
                 .map(|p| Member {
                     id: p.id,
                     context: member_context(&p.raft_addr, &p.client_addr),
+                    learner: false,
                 })
                 .collect();
             members.push(Member {
@@ -383,6 +384,7 @@ impl ClusterNode {
                     &raft_listener.local_addr()?.to_string(),
                     &client_listener.local_addr()?.to_string(),
                 ),
+                learner: false,
             });
             members.sort_unstable_by_key(|m| m.id);
             members
@@ -716,7 +718,11 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
                     if members.iter().any(|m| m.id == id) {
                         return Err(format!("node {id} is already a member"));
                     }
-                    members.push(Member { id, context });
+                    members.push(Member {
+                        id,
+                        context,
+                        learner: true,
+                    });
                     members.sort_unstable_by_key(|m| m.id);
                     Ok(())
                 })
@@ -746,7 +752,7 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
             let node = replica.node();
             Reply::Bulk(
                 format!(
-                    "id:{}\r\nrole:{}\r\nterm:{}\r\nleader:{}\r\ncommit_index:{}\r\napplied_index:{}\r\nlast_index:{}\r\nsnapshot_index:{}\r\nkeys:{}\r\nmembers:{}\r\n",
+                    "id:{}\r\nrole:{}\r\nterm:{}\r\nleader:{}\r\ncommit_index:{}\r\napplied_index:{}\r\nlast_index:{}\r\nsnapshot_index:{}\r\nkeys:{}\r\nmembers:{}\r\nvoters:{}\r\n",
                     node.id(),
                     match node.role() {
                         Role::Leader => "leader",
@@ -763,6 +769,12 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
                     replica.len(),
                     node.members()
                         .iter()
+                        .map(|m| m.id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    node.members()
+                        .iter()
+                        .filter(|m| !m.learner)
                         .map(|m| m.id.to_string())
                         .collect::<Vec<_>>()
                         .join(","),

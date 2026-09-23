@@ -438,10 +438,12 @@ mod tests {
                 Member {
                     id: 1,
                     context: b"a b".to_vec(),
+                    learner: false,
                 },
                 Member {
                     id: 2,
                     context: Vec::new(),
+                    learner: false,
                 },
             ]),
         });
@@ -553,6 +555,7 @@ mod tests {
                     command: Command::Config(vec![Member {
                         id: 9,
                         context: b"127.0.0.1:7009 127.0.0.1:6009".to_vec(),
+                        learner: false,
                     }]),
                 },
             ],

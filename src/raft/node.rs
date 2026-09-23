@@ -210,8 +210,12 @@ pub struct Node<S: Storage> {
     membership_index: u64,
     /// Everyone whose vote counts, this node included if it is a member.
     voters: Vec<NodeId>,
-    /// The voters other than this node: who it replicates to and canvasses.
+    /// The voters other than this node: who it canvasses.
     peers: Vec<NodeId>,
+    /// Everyone a leader sends the log to: every other member, learners
+    /// included, and while a removal is uncommitted the node being removed,
+    /// so that it hears of its removal instead of being dropped mid-sentence.
+    replicas: Vec<NodeId>,
     config: Config,
     storage: S,
 
@@ -251,6 +255,8 @@ pub struct Node<S: Storage> {
     seq: u64,
     /// Leader only: the latest round each follower has answered this term.
     acked: HashMap<NodeId, u64>,
+    /// Leader only: learners are promoted once caught up. On by default.
+    auto_promote: bool,
     /// Leader only: reads followers have asked for, waiting on a round.
     remote_reads: Vec<RemoteRead>,
     /// Follower only: reads forwarded to a leader, by id, and the answers.
@@ -281,6 +287,7 @@ impl<S: Storage> Node<S> {
             .map(|id| Member {
                 id,
                 context: Vec::new(),
+                learner: false,
             })
             .collect();
         Node::with_members(id, members, config, storage)
@@ -298,6 +305,7 @@ impl<S: Storage> Node<S> {
             membership_index: 0,
             voters: Vec::new(),
             peers: Vec::new(),
+            replicas: Vec::new(),
             config,
             storage,
             role: Role::Follower,
@@ -317,6 +325,7 @@ impl<S: Storage> Node<S> {
             seq: 0,
             acked: HashMap::new(),
             remote_reads: Vec::new(),
+            auto_promote: true,
             forwarded: HashMap::new(),
             next_read: 0,
             election_elapsed: 0,
@@ -348,6 +357,19 @@ impl<S: Storage> Node<S> {
     /// Whether this node's vote counts, and so whether it may stand.
     pub fn is_voter(&self) -> bool {
         self.voters.contains(&self.id)
+    }
+
+    /// Whether this node is in the membership at all, as a voter or a
+    /// learner. A node that has been removed, and knows it, is not.
+    pub fn is_member(&self) -> bool {
+        self.members.iter().any(|m| m.id == self.id)
+    }
+
+    /// Whether a leader promotes learners to voters on its own once they
+    /// have caught up. On by default; a caller that would rather decide
+    /// can turn it off and propose the promotion itself.
+    pub fn set_auto_promote(&mut self, on: bool) {
+        self.auto_promote = on;
     }
 
     pub fn role(&self) -> Role {
@@ -494,6 +516,7 @@ impl<S: Storage> Node<S> {
                     self.heartbeat_elapsed = 0;
                     self.broadcast_append(&mut actions)?;
                 }
+                self.maybe_promote(&mut actions)?;
 
                 // Check quorum. Raft on its own never tells a leader it has
                 // been cut off: it keeps the title until it hears a later
@@ -887,13 +910,20 @@ impl<S: Storage> Node<S> {
                 "the last membership change has not committed yet",
             ));
         }
-        let old: HashSet<NodeId> = self.voters.iter().copied().collect();
-        let new: HashSet<NodeId> = members.iter().map(|m| m.id).collect();
-        if new.len() != members.len() {
+        let ids: HashSet<NodeId> = members.iter().map(|m| m.id).collect();
+        if ids.len() != members.len() {
             return Err(ProposeError::Membership("a member is listed twice"));
         }
+        // Learners have no vote, so adding or dropping them moves no
+        // majority. Only the voters are held to one change at a time.
+        let old: HashSet<NodeId> = self.voters.iter().copied().collect();
+        let new: HashSet<NodeId> = members
+            .iter()
+            .filter(|m| !m.learner)
+            .map(|m| m.id)
+            .collect();
         if new.is_empty() {
-            return Err(ProposeError::Membership("a cluster cannot have no members"));
+            return Err(ProposeError::Membership("a cluster cannot have no voters"));
         }
         if old.symmetric_difference(&new).count() > 1 {
             return Err(ProposeError::Membership(
@@ -1070,7 +1100,7 @@ impl<S: Storage> Node<S> {
         let next = self.storage.last_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
-        for &peer in &self.peers {
+        for &peer in &self.replicas {
             // Optimistically assume every follower matches, and find out
             // otherwise from the first rejection.
             self.next_index.insert(peer, next);
@@ -1368,9 +1398,44 @@ impl<S: Storage> Node<S> {
     }
 
     fn broadcast_append(&mut self, actions: &mut Vec<Action>) -> Result<()> {
-        let peers = self.peers.clone();
-        for peer in peers {
+        let departing = self
+            .replicas
+            .iter()
+            .any(|r| !self.members.iter().any(|m| m.id == *r));
+        if departing && self.membership_index <= self.commit_index {
+            // The removal these were kept on for has committed.
+            self.reload_membership();
+        }
+        let replicas = self.replicas.clone();
+        for peer in replicas {
             actions.push(self.append_message_for(peer)?);
+        }
+        Ok(())
+    }
+
+    /// Promote the first learner that has caught up, if nothing else is
+    /// changing. Caught up means holding everything committed so far: from
+    /// then on it keeps pace like any follower, so the cluster can count on
+    /// its vote without waiting for a whole store to be sent to it.
+    fn maybe_promote(&mut self, actions: &mut Vec<Action>) -> Result<()> {
+        if !self.auto_promote || !self.ready_to_serve() || self.membership_index > self.commit_index
+        {
+            return Ok(());
+        }
+        let ready = self.members.iter().position(|m| {
+            m.learner && self.match_index.get(&m.id).copied().unwrap_or(0) >= self.commit_index
+        });
+        let Some(position) = ready else {
+            return Ok(());
+        };
+        let mut members = self.members.clone();
+        members[position].learner = false;
+        match self.propose_membership(members) {
+            Ok(accepted) => actions.extend(accepted.actions),
+            Err(ProposeError::Storage(e)) => return Err(e),
+            // Anything else means now is not the time; the next tick asks
+            // again.
+            Err(_) => {}
         }
         Ok(())
     }
@@ -1445,8 +1510,8 @@ impl<S: Storage> Node<S> {
         self.seq += 1;
         let index = self.commit_index.max(self.leader_start);
         let snapshot = self.storage.snapshot_meta().index;
-        let peers = self.peers.clone();
-        for peer in peers {
+        let replicas = self.replicas.clone();
+        for peer in replicas {
             let next = self
                 .next_index
                 .get(&peer)
@@ -1775,11 +1840,33 @@ impl<S: Storage> Node<S> {
             }
         }
 
-        let mut voters: Vec<NodeId> = members.iter().map(|m| m.id).collect();
+        let mut voters: Vec<NodeId> = members
+            .iter()
+            .filter(|m| !m.learner)
+            .map(|m| m.id)
+            .collect();
         voters.sort_unstable();
         voters.dedup();
+        let mut replicas: Vec<NodeId> = members
+            .iter()
+            .map(|m| m.id)
+            .filter(|&id| id != self.id)
+            .collect();
+        // While a removal is uncommitted, the node being removed is still
+        // sent the log, so that the entry removing it usually reaches it.
+        // Once it has that entry it knows it is out, and stops standing.
+        if at > self.commit_index {
+            for member in self.members_at(at - 1) {
+                if member.id != self.id && !replicas.contains(&member.id) {
+                    replicas.push(member.id);
+                }
+            }
+        }
+        replicas.sort_unstable();
+        replicas.dedup();
         self.peers = voters.iter().copied().filter(|&v| v != self.id).collect();
         self.voters = voters;
+        self.replicas = replicas;
         self.members = members;
         self.membership_index = at;
 
@@ -1787,14 +1874,14 @@ impl<S: Storage> Node<S> {
             // A new peer is found out about the usual way: offered the
             // log from its end, and rewound from its first refusal.
             let next = self.storage.last_index() + 1;
-            for &peer in &self.peers {
+            for &peer in &self.replicas {
                 self.next_index.entry(peer).or_insert(next);
                 self.match_index.entry(peer).or_insert(0);
             }
-            let peers = &self.peers;
-            self.next_index.retain(|p, _| peers.contains(p));
-            self.match_index.retain(|p, _| peers.contains(p));
-            self.snapshot_progress.retain(|p, _| peers.contains(p));
+            let replicas = &self.replicas;
+            self.next_index.retain(|p, _| replicas.contains(p));
+            self.match_index.retain(|p, _| replicas.contains(p));
+            self.snapshot_progress.retain(|p, _| replicas.contains(p));
         }
     }
 
@@ -2617,6 +2704,7 @@ mod tests {
         Member {
             id,
             context: Vec::new(),
+            learner: false,
         }
     }
 
@@ -2657,6 +2745,27 @@ mod tests {
             conflict_term: None,
             seq: 0,
         }
+    }
+
+    /// A learner's progress counts towards no commit, however far ahead of
+    /// the voters it is.
+    #[test]
+    fn a_learner_does_not_count_towards_a_commit() {
+        let mut node = follower(2, &[(1, 2)]);
+        node.leader_with(&[(2, 0), (3, 0)]);
+        let mut members = vec![member(1), member(2), member(3)];
+        members.push(Member::learner(4, Vec::new()));
+        members.push(Member::learner(5, Vec::new()));
+        node.commit_index = 1;
+        node.leader_start = 1;
+        node.propose_membership(members).unwrap();
+        // Both learners hold everything; neither voting follower does. The
+        // leader and two copies would be three of five, if they counted.
+        let last = node.last_index();
+        node.match_index.insert(4, last);
+        node.match_index.insert(5, last);
+        node.maybe_commit();
+        assert_eq!(node.commit_index(), 1, "learners' copies made a majority");
     }
 
     /// A node with no membership stands for nothing, however long it waits.
