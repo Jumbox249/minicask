@@ -325,6 +325,17 @@ impl<S: Storage> ReplicatedStore<S> {
         self.node.propose(bytes)
     }
 
+    /// Propose several already-encoded commands as one batch. See
+    /// [`Node::propose_batch`].
+    #[allow(clippy::type_complexity)]
+    pub fn propose_batch(
+        &mut self,
+        commands: Vec<Vec<u8>>,
+    ) -> std::result::Result<(Vec<std::result::Result<u64, ProposeError>>, Vec<Action>), ProposeError>
+    {
+        self.node.propose_batch(commands)
+    }
+
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> std::result::Result<Accepted, ProposeError> {
         self.propose(&Op::Put {
             key: key.to_vec(),
@@ -402,10 +413,14 @@ impl<S: Storage> ReplicatedStore<S> {
             }
             match &entry.command {
                 Command::Noop => {}
+                // Not synced one at a time: the whole batch is synced once,
+                // below, before the applied index says it is there. Until
+                // then the log still holds every one of these, so a crash
+                // loses nothing that a replay will not put back.
                 Command::Data(bytes) => match Op::decode(bytes)? {
-                    Op::Put { key, value } => self.store.put(&key, &value)?,
+                    Op::Put { key, value } => self.store.put_deferred(&key, &value)?,
                     Op::Delete { key } => {
-                        self.store.delete(&key)?;
+                        self.store.delete_deferred(&key)?;
                     }
                 },
             }
@@ -419,7 +434,7 @@ impl<S: Storage> ReplicatedStore<S> {
             // skipped for good. This matters when the store trades fsyncs
             // for speed; with every write synced it costs one cheap call.
             self.store.sync()?;
-            write_applied(self.store.dir(), self.applied)?;
+            write_applied(&self.store, self.applied)?;
         }
 
         if !self.background_snapshots {
@@ -471,7 +486,7 @@ impl<S: Storage> ReplicatedStore<S> {
 
         self.store.sync()?;
         self.applied = index;
-        write_applied(self.store.dir(), index)
+        write_applied(&self.store, index)
     }
 }
 
@@ -576,7 +591,18 @@ fn read_applied(dir: &Path) -> u64 {
     u64::from_le_bytes(bytes[4..12].try_into().expect("eight bytes"))
 }
 
-fn write_applied(dir: &Path, index: u64) -> Result<()> {
+/// Record that the store holds everything up to `index`.
+///
+/// The store has to be synced first. Written the other way round, a crash
+/// between the two leaves an index claiming writes the store has lost, and
+/// they are skipped for good. The check is only in debug builds, which is
+/// where the tests run; `simulate_power_cut` shows what it guards against.
+fn write_applied(store: &Store, index: u64) -> Result<()> {
+    debug_assert!(
+        store.is_synced(),
+        "the applied index is about to be written ahead of the store"
+    );
+    let dir = store.dir();
     let body = index.to_le_bytes();
     let mut buf = [0u8; 12];
     buf[0..4].copy_from_slice(&crc32_parts(&[&body]).to_le_bytes());
@@ -590,7 +616,7 @@ mod tests {
     use crate::raft::StorageExt;
     use std::io::Read;
 
-    fn encode_snapshot(store: &Store) -> Result<Vec<u8>> {
+    fn encode_snapshot(store: &mut Store) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         write_snapshot(&store.view()?, &mut out)?;
         Ok(out)
@@ -628,7 +654,7 @@ mod tests {
         store.delete(b"gone").unwrap();
         store.put(b"a", b"overwritten").unwrap();
 
-        let pairs = decode_snapshot(&encode_snapshot(&store).unwrap()).unwrap();
+        let pairs = decode_snapshot(&encode_snapshot(&mut store).unwrap()).unwrap();
         assert_eq!(
             pairs,
             vec![
@@ -636,6 +662,18 @@ mod tests {
                 (b"b".to_vec(), Vec::new()),
             ]
         );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A view reads the files through handles of its own, so a write still
+    /// in the store's buffer has to reach the file before the view is taken.
+    #[test]
+    fn a_snapshot_includes_writes_that_were_still_buffered() {
+        let (path, mut store) = temp_store("buffered");
+        store.put_deferred(b"buffered", b"yes").unwrap();
+        let pairs = decode_snapshot(&encode_snapshot(&mut store).unwrap()).unwrap();
+        assert_eq!(pairs, vec![(b"buffered".to_vec(), b"yes".to_vec())]);
         drop(store);
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -651,8 +689,8 @@ mod tests {
             two.put(k.as_bytes(), v.as_bytes()).unwrap();
         }
         assert_eq!(
-            encode_snapshot(&one).unwrap(),
-            encode_snapshot(&two).unwrap()
+            encode_snapshot(&mut one).unwrap(),
+            encode_snapshot(&mut two).unwrap()
         );
         drop((one, two));
         let _ = std::fs::remove_dir_all(&p1);
@@ -663,7 +701,7 @@ mod tests {
     fn a_damaged_snapshot_is_refused() {
         let (path, mut store) = temp_store("damaged");
         store.put(b"key", b"value").unwrap();
-        let mut data = encode_snapshot(&store).unwrap();
+        let mut data = encode_snapshot(&mut store).unwrap();
         let last = data.len() - 1;
         data[last] ^= 0b0000_0100;
         assert!(matches!(decode_snapshot(&data), Err(Error::Corrupt { .. })));
@@ -698,7 +736,7 @@ mod tests {
         source.put(b"same", b"1").unwrap();
         source.put(b"changed", b"new").unwrap();
         source.put(b"missing", b"only in the snapshot").unwrap();
-        let snapshot = encode_snapshot(&source).unwrap();
+        let snapshot = encode_snapshot(&mut source).unwrap();
 
         let replica = restored(store, &snapshot);
         assert_eq!(replica.applied_index(), 5);
@@ -724,7 +762,7 @@ mod tests {
         for i in 0..20u8 {
             store.put(&[b'k', i], &[b'v'; 64]).unwrap();
         }
-        let snapshot = encode_snapshot(&store).unwrap();
+        let snapshot = encode_snapshot(&mut store).unwrap();
         let before = store.stats().disk_bytes;
 
         let replica = restored(store, &snapshot);
@@ -750,7 +788,7 @@ mod tests {
         for key in ["b", "c", "n", "x"] {
             source.put(key.as_bytes(), key.as_bytes()).unwrap();
         }
-        let replica = restored(store, &encode_snapshot(&source).unwrap());
+        let replica = restored(store, &encode_snapshot(&mut source).unwrap());
 
         let mut keys: Vec<Vec<u8>> = replica.store().keys().map(<[u8]>::to_vec).collect();
         keys.sort();
@@ -921,6 +959,41 @@ mod tests {
         replica.step(2, append(2)).unwrap();
         assert_eq!(replica.read_state(&read), ReadState::Ready(2));
         assert_eq!(replica.get(b"k").unwrap(), Some(b"v".to_vec()));
+        drop(replica);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// What the ordering rule is for. Writes are applied to the store
+    /// without a sync each, and a power cut throws away whatever was not
+    /// synced. However the cut falls, the applied index that survives must
+    /// not claim a write the store lost, or the write is skipped for good.
+    #[test]
+    fn a_power_cut_never_leaves_the_applied_index_ahead_of_the_store() {
+        use crate::raft::{Config, MemStorage};
+        let (path, store) = temp_store("power-cut");
+        let mut replica = single_node(store);
+        replica.set_snapshot_every(0);
+        for i in 0..20 {
+            put_and_apply(&mut replica, &format!("key-{i:02}"), "v");
+        }
+        let (storage, store) = replica.into_parts();
+        store.simulate_power_cut().unwrap();
+
+        let store = Store::open(&path).unwrap();
+        let applied = read_applied(store.dir());
+        assert!(applied > 0, "nothing was recorded as applied");
+        let node = Node::new(1, vec![1], Config::default(), storage);
+        let replica = ReplicatedStore::<MemStorage>::new(node, store).unwrap();
+        // Every entry up to the applied index is a put of one key, after
+        // the no-op at index 1; each one must still be in the store.
+        for i in 0..(applied - 1) {
+            let key = format!("key-{i:02}");
+            assert_eq!(
+                replica.get(key.as_bytes()).unwrap(),
+                Some(b"v".to_vec()),
+                "{key} is below the applied index but the power cut took it"
+            );
+        }
         drop(replica);
         let _ = std::fs::remove_dir_all(&path);
     }

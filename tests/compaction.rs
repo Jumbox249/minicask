@@ -149,3 +149,33 @@ fn the_active_file_rolls_over_once_it_is_full() {
     assert_eq!(store.len(), 300);
     assert_eq!(store.get(b"key-150").unwrap(), Some(b"value-150".to_vec()));
 }
+
+/// A deferred write may still be in the writer's buffer rather than in a
+/// file, and a compaction reads records back out of the files. It must
+/// not lose one on the way.
+#[test]
+fn deferred_writes_survive_a_compaction() {
+    let dir = TempDir::new("compact-deferred");
+    let mut store = Store::open(dir.path()).unwrap();
+    for i in 0..50 {
+        store
+            .put_deferred(format!("key-{i}").as_bytes(), b"old")
+            .unwrap();
+    }
+    for i in 0..50 {
+        store
+            .put_deferred(format!("key-{i}").as_bytes(), format!("new-{i}").as_bytes())
+            .unwrap();
+    }
+    store.compact().unwrap();
+    for i in 0..50 {
+        assert_eq!(
+            store.get(format!("key-{i}").as_bytes()).unwrap(),
+            Some(format!("new-{i}").into_bytes())
+        );
+    }
+    drop(store);
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.len(), 50);
+    assert_eq!(store.get(b"key-7").unwrap(), Some(b"new-7".to_vec()));
+}

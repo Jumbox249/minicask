@@ -28,7 +28,7 @@ use crate::error::Result;
 use crate::raft::{
     wire, Action, Config, DiskStorage, Message, Node, NodeId, ProposeError, ReadState, Role,
 };
-use crate::replicated::ReplicatedStore;
+use crate::replicated::{Op, ReplicatedStore};
 use crate::resp::{self, Reply};
 use crate::store::Store;
 use std::collections::HashMap;
@@ -95,6 +95,84 @@ struct Shared {
     /// rather than the map keeps dispatch to one peer off another's path.
     senders: HashMap<NodeId, Mutex<Sender<Message>>>,
     client_addrs: HashMap<NodeId, String>,
+    proposals: Proposals,
+}
+
+/// What a proposal came to: where it landed in the log and in which term,
+/// or the reply that says why it did not.
+type Proposed = std::result::Result<(u64, u64), Reply>;
+
+/// Group commit for writes.
+///
+/// Appending to the log means an fsync, and the node's lock is held while
+/// it happens, so proposing one write at a time caps a node at one write
+/// per fsync however many clients there are. Instead, each write joins a
+/// queue, and whoever finds nobody proposing takes the whole queue and
+/// proposes it as one batch: one append, one fsync, one message to each
+/// follower. Writes that arrive meanwhile queue up for the next batch.
+struct Proposals {
+    queue: Mutex<Queue>,
+    answered: Condvar,
+}
+
+#[derive(Default)]
+struct Queue {
+    waiting: Vec<(u64, Vec<u8>)>,
+    answers: HashMap<u64, Proposed>,
+    busy: bool,
+    next_ticket: u64,
+}
+
+impl Proposals {
+    fn new() -> Proposals {
+        Proposals {
+            queue: Mutex::new(Queue::default()),
+            answered: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Propose `command`, alone or with whatever else is waiting.
+    ///
+    /// `propose` is called at most once, with the batch this thread ended
+    /// up proposing, and must answer every command in it in order. A thread
+    /// whose command someone else proposed never calls it.
+    fn submit(
+        &self,
+        command: Vec<u8>,
+        propose: impl FnOnce(Vec<Vec<u8>>) -> Vec<Proposed>,
+    ) -> Proposed {
+        let mut queue = self.lock();
+        let ticket = queue.next_ticket;
+        queue.next_ticket += 1;
+        queue.waiting.push((ticket, command));
+
+        let mut propose = Some(propose);
+        loop {
+            if let Some(answer) = queue.answers.remove(&ticket) {
+                return answer;
+            }
+            if !queue.busy {
+                // Nobody is proposing, so this command has not been taken,
+                // and is in the batch this thread is about to propose.
+                queue.busy = true;
+                let (tickets, commands): (Vec<u64>, Vec<Vec<u8>>) =
+                    std::mem::take(&mut queue.waiting).into_iter().unzip();
+                drop(queue);
+                let propose = propose.take().expect("a thread proposes at most once");
+                let answers = propose(commands);
+                queue = self.lock();
+                queue.busy = false;
+                queue.answers.extend(tickets.into_iter().zip(answers));
+                self.answered.notify_all();
+                continue;
+            }
+            queue = self.answered.wait(queue).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 impl Shared {
@@ -230,6 +308,7 @@ impl ClusterNode {
                 progress: Condvar::new(),
                 senders,
                 client_addrs,
+                proposals: Proposals::new(),
             }),
             raft_listener,
             client_listener,
@@ -498,13 +577,19 @@ fn dispatch(shared: &Arc<Shared>, args: &[Vec<u8>]) -> Reply {
         },
 
         "SET" => match rest {
-            [key, value] => write(shared, |r| r.put(key, value)),
+            [key, value] => write(
+                shared,
+                &Op::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+            ),
             [_, _, ..] => Reply::err("this cluster's SET takes no options"),
             _ => wrong_arity(&name),
         },
         "DEL" => match rest {
             [] => wrong_arity(&name),
-            [key] => write(shared, |r| r.delete(key)),
+            [key] => write(shared, &Op::Delete { key: key.clone() }),
             _ => Reply::err("this cluster's DEL takes one key"),
         },
 
@@ -566,21 +651,42 @@ fn read(shared: &Arc<Shared>, f: impl FnOnce(&Replica) -> Reply) -> Reply {
     }
 }
 
-/// Propose a write and wait for it to take effect here, which means a
-/// majority has it on disk.
-fn write(
-    shared: &Arc<Shared>,
-    propose: impl FnOnce(&mut Replica) -> std::result::Result<crate::raft::Accepted, ProposeError>,
-) -> Reply {
-    let (index, term, actions) = {
-        let mut replica = shared.lock();
-        match propose(&mut replica) {
-            Ok(accepted) => (accepted.index, replica.node().term(), accepted.actions),
-            Err(ProposeError::NotLeader { .. }) => return not_leader(shared, &replica),
-            Err(e) => return Reply::err(e.to_string()),
-        }
+/// Propose a write, batched with any others, and wait for it to take
+/// effect here, which means a majority has it on disk.
+fn write(shared: &Arc<Shared>, op: &Op) -> Reply {
+    let command = match op.encode() {
+        Ok(command) => command,
+        Err(e) => return Reply::err(e.to_string()),
     };
-    shared.dispatch(actions);
+    let proposed = shared.proposals.submit(command, |commands| {
+        let count = commands.len();
+        let (answers, actions) = {
+            let mut replica = shared.lock();
+            let term = replica.node().term();
+            match replica.propose_batch(commands) {
+                Ok((results, actions)) => (
+                    results
+                        .into_iter()
+                        .map(|r| {
+                            r.map(|index| (index, term))
+                                .map_err(|e| Reply::err(e.to_string()))
+                        })
+                        .collect(),
+                    actions,
+                ),
+                Err(ProposeError::NotLeader { .. }) => {
+                    (vec![Err(not_leader(shared, &replica)); count], Vec::new())
+                }
+                Err(e) => (vec![Err(Reply::err(e.to_string())); count], Vec::new()),
+            }
+        };
+        shared.dispatch(actions);
+        answers
+    });
+    let (index, term) = match proposed {
+        Ok(landed) => landed,
+        Err(reply) => return reply,
+    };
 
     let deadline = Instant::now() + COMMIT_TIMEOUT;
     let outcome = shared.wait_for(deadline, |replica| {
@@ -618,4 +724,68 @@ fn wrong_arity(name: &str) -> Reply {
         "wrong number of arguments for '{}' command",
         name.to_ascii_lowercase()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes that arrive while a batch is being proposed go out together
+    /// in the next one, rather than one by one behind it.
+    #[test]
+    fn proposals_that_queue_behind_a_batch_go_out_together() {
+        let proposals = Arc::new(Proposals::new());
+        let batches = Arc::new(Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
+        let answer = |commands: Vec<Vec<u8>>| -> Vec<Proposed> {
+            commands.iter().map(|c| Ok((c[0] as u64, 1))).collect()
+        };
+
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = {
+            let (proposals, batches) = (Arc::clone(&proposals), Arc::clone(&batches));
+            thread::spawn(move || {
+                proposals.submit(vec![1], |commands| {
+                    batches.lock().unwrap().push(commands.clone());
+                    inside_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    answer(commands)
+                })
+            })
+        };
+        inside_rx.recv().unwrap();
+
+        let later: Vec<_> = [2u8, 3]
+            .into_iter()
+            .map(|n| {
+                let (proposals, batches) = (Arc::clone(&proposals), Arc::clone(&batches));
+                thread::spawn(move || {
+                    proposals.submit(vec![n], |commands| {
+                        batches.lock().unwrap().push(commands.clone());
+                        answer(commands)
+                    })
+                })
+            })
+            .collect();
+        // Both have to be queued behind the first batch. If either goes
+        // out on its own instead, they never both queue.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while proposals.lock().waiting.len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "a second batch was proposed while the first was still in flight"
+            );
+            thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+
+        assert_eq!(first.join().unwrap(), Ok((1, 1)));
+        let mut results: Vec<Proposed> = later.into_iter().map(|t| t.join().unwrap()).collect();
+        results.sort_by_key(|r| r.as_ref().map(|&(i, _)| i).unwrap_or(0));
+        assert_eq!(results, vec![Ok((2, 1)), Ok((3, 1))]);
+
+        let mut batches = batches.lock().unwrap().clone();
+        batches[1].sort();
+        assert_eq!(batches, vec![vec![vec![1]], vec![vec![2], vec![3]]]);
+    }
 }

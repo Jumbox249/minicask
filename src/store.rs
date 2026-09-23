@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::log::{
-    self, data_file_path, list_data_files, LogWriter, ScanOutcome, Scanner, SyncPolicy,
+    self, data_file_path, list_data_files, LogWriter, Reach, ScanOutcome, Scanner, SyncPolicy,
 };
 use crate::record::{self, HEADER_LEN};
 use std::collections::HashMap;
@@ -92,6 +92,10 @@ pub struct Store {
     opts: Options,
     live_bytes: u64,
     disk_bytes: u64,
+    /// How much of each sealed file had reached the disk when it was
+    /// sealed. Sealing syncs, so this is all of it; it is kept so that
+    /// [`simulate_power_cut`](Store::simulate_power_cut) can tell.
+    sealed_synced: HashMap<u64, u64>,
 }
 
 impl Store {
@@ -174,30 +178,117 @@ impl Store {
             opts,
             live_bytes,
             disk_bytes,
+            sealed_synced: HashMap::new(),
         })
+    }
+
+    pub fn options(&self) -> Options {
+        self.opts
+    }
+
+    /// Where appends have reached: the active file's id and the offset in
+    /// it. Points compare in the order they were written, which is what a
+    /// caller doing its own group commit needs to know whether a sync
+    /// covered a write.
+    pub(crate) fn append_point(&self) -> (u64, u64) {
+        (self.writer.file_id, self.writer.offset)
+    }
+
+    /// A handle that can fsync everything appended so far without holding
+    /// the store, and the point it will have made durable once it has.
+    ///
+    /// Everything in files before the active one is durable already,
+    /// because sealing a file syncs it, so syncing the active file is
+    /// enough.
+    pub(crate) fn sync_handle(&mut self) -> Result<SyncHandle> {
+        // The handle sees only what the kernel has, so the buffer goes to
+        // the kernel first. That is one write, and the fsync that follows
+        // runs without the store.
+        self.writer.flush()?;
+        Ok(SyncHandle {
+            file: self.writer.try_clone_file()?,
+            point: self.append_point(),
+        })
+    }
+
+    /// Record that a [`SyncHandle`] made everything up to `point` durable,
+    /// so that the store's own account of what is on the disk, which
+    /// [`is_synced`](Store::is_synced) and a simulated power cut go by, is
+    /// not behind the truth.
+    pub(crate) fn note_synced(&mut self, point: (u64, u64)) {
+        if point.0 == self.writer.file_id && point.1 > self.writer.synced {
+            self.writer.synced = point.1;
+        }
+    }
+
+    /// Whether everything written has reached the disk.
+    pub(crate) fn is_synced(&self) -> bool {
+        self.writer.synced == self.writer.offset
+    }
+
+    /// Throw away everything that has not been synced, which is what a
+    /// power cut does, and close the store.
+    ///
+    /// This is for tests of the ordering rules that durability depends on,
+    /// which cannot otherwise be observed without pulling a plug. A write
+    /// the store has only handed to the kernel is gone afterwards, exactly
+    /// as it would be.
+    #[doc(hidden)]
+    pub fn simulate_power_cut(mut self) -> Result<()> {
+        let mut cut: Vec<(u64, u64)> = self
+            .sealed_synced
+            .iter()
+            .map(|(&id, &synced)| (id, synced))
+            .collect();
+        cut.push((self.writer.file_id, self.writer.synced));
+        let dir = self.dir.clone();
+        // The writer's buffer is memory, and goes with the power. Closing
+        // normally would flush it.
+        self.writer.discard_buffer();
+        drop(self);
+        for (id, synced) in cut {
+            let path = data_file_path(&dir, id);
+            if path.exists() {
+                let file = OpenOptions::new().write(true).open(path)?;
+                // Only ever shorter: what never reached the file cannot be
+                // on the disk, whatever the store believed it had synced.
+                let len = file.metadata()?.len().min(synced);
+                file.set_len(len)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// How far the sync policy says an ordinary write has to get.
+    fn reach(&self) -> Reach {
+        match self.opts.sync {
+            SyncPolicy::EveryWrite => Reach::Disk,
+            SyncPolicy::OsCache => Reach::Kernel,
+        }
     }
 
     /// Store a value, replacing any previous one for this key.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        let sync = self.opts.sync == SyncPolicy::EveryWrite;
-        self.put_with(key, value, sync)
+        let reach = self.reach();
+        self.put_with(key, value, reach)
     }
 
-    /// Store a value without waiting for it to reach the disk, whatever the
+    /// Store a value without waiting for it to go anywhere, whatever the
     /// sync policy. It is visible to reads at once, and durable after the
-    /// next [`sync`](Store::sync).
+    /// next [`sync`](Store::sync); until then not even a crash of the
+    /// process is survived, since it may not have reached the kernel.
     ///
     /// For a caller that writes many records and needs them durable as a
     /// batch rather than one at a time: one fsync for the lot instead of
-    /// one each.
+    /// one each, and not even a system call for most of them.
     pub fn put_deferred(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_with(key, value, false)
+        self.put_with(key, value, Reach::Buffer)
     }
 
-    fn put_with(&mut self, key: &[u8], value: &[u8], sync: bool) -> Result<()> {
+    fn put_with(&mut self, key: &[u8], value: &[u8], reach: Reach) -> Result<()> {
         let bytes = record::encode(key, Some(value), record::now_millis())?;
         self.roll_if_needed(bytes.len() as u64)?;
-        let (offset, len) = self.writer.append(&bytes, sync)?;
+        let (offset, len) = self.writer.append(&bytes, reach)?;
 
         self.disk_bytes += len as u64;
         if let Some(old) = self.keydir.remove(key) {
@@ -223,6 +314,11 @@ impl Store {
         let Some(loc) = self.keydir.get(key) else {
             return Ok(None);
         };
+        if loc.file_id == self.writer.file_id {
+            if let Some(bytes) = self.writer.buffered(loc.offset, loc.len) {
+                return decode_value(bytes, loc).map(Some);
+            }
+        }
         read_value(&self.readers, loc).map(Some)
     }
 
@@ -231,23 +327,23 @@ impl Store {
     /// Deletion appends a tombstone rather than erasing anything, so the
     /// space comes back at the next compaction, not immediately.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
-        let sync = self.opts.sync == SyncPolicy::EveryWrite;
-        self.delete_with(key, sync)
+        let reach = self.reach();
+        self.delete_with(key, reach)
     }
 
-    /// Remove a key without waiting for the tombstone to reach the disk.
-    /// See [`put_deferred`](Store::put_deferred).
+    /// Remove a key without waiting for the tombstone to go anywhere. See
+    /// [`put_deferred`](Store::put_deferred).
     pub fn delete_deferred(&mut self, key: &[u8]) -> Result<bool> {
-        self.delete_with(key, false)
+        self.delete_with(key, Reach::Buffer)
     }
 
-    fn delete_with(&mut self, key: &[u8], sync: bool) -> Result<bool> {
+    fn delete_with(&mut self, key: &[u8], reach: Reach) -> Result<bool> {
         if !self.keydir.contains_key(key) {
             return Ok(false);
         }
         let bytes = record::encode(key, None, record::now_millis())?;
         self.roll_if_needed(bytes.len() as u64)?;
-        let (_, len) = self.writer.append(&bytes, sync)?;
+        let (_, len) = self.writer.append(&bytes, reach)?;
 
         self.disk_bytes += len as u64;
         if let Some(old) = self.keydir.remove(key) {
@@ -298,6 +394,9 @@ impl Store {
     /// crash partway through leaves the old files untouched and the next
     /// startup simply ignores the incomplete merge.
     pub fn compact(&mut self) -> Result<CompactReport> {
+        // The merge reads records back out of the files, so none of them
+        // can still be sitting in the writer's buffer.
+        self.writer.flush()?;
         let before = self.stats();
         let old_ids: Vec<u64> = self.readers.keys().copied().collect();
         let merged_id = old_ids.iter().copied().max().unwrap_or(0) + 1;
@@ -324,7 +423,7 @@ impl Store {
             // Copying the encoded bytes verbatim keeps each record's original
             // checksum and timestamp intact.
             let bytes = log::read_at(file, loc.offset, loc.len)?;
-            let (offset, len) = writer.append(&bytes, false)?;
+            let (offset, len) = writer.append(&bytes, Reach::Buffer)?;
             merged_bytes += len as u64;
             merged.insert(
                 key,
@@ -341,6 +440,7 @@ impl Store {
         // The merged file is durable now, so the originals are safe to drop.
         for id in &old_ids {
             self.readers.remove(id);
+            self.sealed_synced.remove(id);
             let path = data_file_path(&self.dir, *id);
             if path.exists() {
                 std::fs::remove_file(path)?;
@@ -376,7 +476,10 @@ impl Store {
     /// opens files on Windows with delete sharing), and the view's handles
     /// keep the data readable until they close, but the caller that owns
     /// the store is still better off not compacting while a view is out.
-    pub(crate) fn view(&self) -> Result<StoreView> {
+    pub(crate) fn view(&mut self) -> Result<StoreView> {
+        // The view reads the files through handles of its own, so anything
+        // still buffered has to be in them first.
+        self.writer.flush()?;
         let mut entries: Vec<(Vec<u8>, Location)> =
             self.keydir.iter().map(|(k, v)| (k.clone(), *v)).collect();
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -396,11 +499,27 @@ impl Store {
         // one now: `sync` only ever reaches the active file, so after this
         // point nothing would.
         self.writer.sync()?;
+        self.sealed_synced
+            .insert(self.writer.file_id, self.writer.synced);
         let next_id = self.writer.file_id + 1;
         self.writer = LogWriter::open(&self.dir, next_id)?;
         self.readers
             .insert(next_id, File::open(data_file_path(&self.dir, next_id))?);
         Ok(())
+    }
+}
+
+/// See [`Store::sync_handle`].
+pub(crate) struct SyncHandle {
+    file: File,
+    point: (u64, u64),
+}
+
+impl SyncHandle {
+    /// Fsync, and return the point that is now durable.
+    pub(crate) fn sync(self) -> Result<(u64, u64)> {
+        self.file.sync_data()?;
+        Ok(self.point)
     }
 }
 
@@ -439,8 +558,16 @@ fn read_value(readers: &HashMap<u64, File>, loc: &Location) -> Result<Vec<u8>> {
     let file = readers
         .get(&loc.file_id)
         .ok_or(corrupt("index points at a data file that is not open"))?;
+    decode_value(&log::read_at(file, loc.offset, loc.len)?, loc)
+}
 
-    let bytes = log::read_at(file, loc.offset, loc.len)?;
+/// Check a record's bytes and take its value out of them.
+fn decode_value(bytes: &[u8], loc: &Location) -> Result<Vec<u8>> {
+    let corrupt = |detail| Error::Corrupt {
+        file_id: loc.file_id,
+        offset: loc.offset,
+        detail,
+    };
     let header_bytes: &[u8; HEADER_LEN] = bytes
         .get(..HEADER_LEN)
         .and_then(|h| h.try_into().ok())

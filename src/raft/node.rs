@@ -693,6 +693,58 @@ impl<S: Storage> Node<S> {
         Ok(actions)
     }
 
+    /// Offer several commands at once, as consecutive entries.
+    ///
+    /// They are appended to the log in one write, so one fsync covers them
+    /// all, and offered to the followers in one message each. That is the
+    /// whole of group commit on the consensus side: a server gathers the
+    /// proposals that arrive while one is being appended and sends them
+    /// here together.
+    ///
+    /// Each command gets its own answer, its index or why it was refused;
+    /// the whole batch is refused only when this node cannot accept
+    /// anything at all.
+    #[allow(clippy::type_complexity)]
+    pub fn propose_batch(
+        &mut self,
+        commands: Vec<Vec<u8>>,
+    ) -> std::result::Result<(Vec<std::result::Result<u64, ProposeError>>, Vec<Action>), ProposeError>
+    {
+        if self.role != Role::Leader {
+            return Err(ProposeError::NotLeader {
+                leader: self.leader_id,
+            });
+        }
+        let term = self.term();
+        let mut next = self.storage.last_index() + 1;
+        let mut entries = Vec::with_capacity(commands.len());
+        let mut answers = Vec::with_capacity(commands.len());
+        for command in commands {
+            let len = command.len() + super::log::ENTRY_OVERHEAD;
+            if len > self.config.max_entry_bytes {
+                answers.push(Err(ProposeError::TooLarge {
+                    len,
+                    max: self.config.max_entry_bytes,
+                }));
+                continue;
+            }
+            entries.push(Entry {
+                term,
+                index: next,
+                command: Command::Data(command),
+            });
+            answers.push(Ok(next));
+            next += 1;
+        }
+        let mut actions = Vec::new();
+        if !entries.is_empty() {
+            self.storage.append(&entries)?;
+            self.maybe_commit();
+            self.broadcast_append(&mut actions)?;
+        }
+        Ok((answers, actions))
+    }
+
     /// Offer a command to the cluster. Only a leader can accept one.
     pub fn propose(&mut self, command: Vec<u8>) -> std::result::Result<Accepted, ProposeError> {
         if self.role != Role::Leader {

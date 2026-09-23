@@ -90,6 +90,15 @@ The merged file takes an id higher than everything it replaces, and the original
 | startup replay | 1,271,554 records/sec |
 | compaction | 361,122 records/sec |
 
+The server rows were measured separately, on a Windows machine whose disk manages about 400 fsyncs a second, with each client sending one `SET` and waiting for its reply before the next, against a store that syncs every write:
+
+| Server `SET`, fsync every write | Before group commit | After |
+| --- | --- | --- |
+| 1 client | 408 ops/sec | 410 ops/sec |
+| 16 clients | 423 ops/sec | 3,300 ops/sec |
+
+One client is still one fsync per write, since each write waits for its own before the next is sent; that is the guarantee, and batching cannot change it. Sixteen clients share them. The same buffer made compaction's merge about twice as fast on that machine, 217,000 to 458,000 records a second, since the merged file's appends now go to the kernel a megabyte at a time.
+
 The 100x gap between the two write rows is the fsync, not the store. It is the cost of the default guarantee, and `SyncPolicy::OsCache` is there for callers who would rather have the speed.
 
 Compaction originally ran at 4,087 records/sec because the merge inherited the store's fsync-per-write policy. Since the merge is one long sequential write and the only barrier that matters is a single sync before the originals are unlinked, batching it made compaction 88 times faster with no change to the guarantee.
@@ -138,7 +147,11 @@ The commands it answers: `GET`, `SET` (with `NX` and `XX`), `MGET`, `MSET`, `DEL
 
 Pipelining works, including `redis-cli --pipe`: replies to a batch of commands go out in one write. Inline commands (`GET greeting` on a bare line) work too, so `telnet` and `nc` are enough to poke at it. A protocol error closes that one connection and no other.
 
-Concurrency is a mutex. The store is single-threaded by design, so each connection gets a thread and each command takes the lock for exactly one read or one append. That is the simplest correct thing, and it means the server's write throughput is the store's: 4.5k/sec with fsync on every write, 100x that with `--no-fsync`.
+Each connection gets a thread, and the store sits behind a read-write lock. Reads share it: a read is a hash lookup and a positional read of the file, which moves no cursor another reader depends on, so any number run at once. Writes take it alone.
+
+Writes are group-committed. A write appends under the lock and lets go of it before the disk has the bytes, and its reply is held until an fsync has covered it. Whoever needs an fsync first runs one, outside the lock, and every write that landed before it started is made durable by that one call. So many clients writing at once share fsyncs instead of queueing for one each, and a pipelined batch from one client waits once. Replies are held in the server's own buffer rather than a `BufWriter`, which would send whenever it filled, possibly ahead of the disk. If the disk refuses an fsync, the server says so and hangs up rather than acknowledge writes it cannot vouch for.
+
+The first version of this batched nothing on Windows: 1,600 writes from 16 clients took 1,571 fsyncs. NTFS holds a write to a file until a flush of that same file has finished, and measured, a 64-byte append that takes under a microsecond alone took half a millisecond beside a flush. So while one thread fsynced, every other writer sat inside its append, and each fsync covered about one write. The fix is a small buffer in the writer: a deferred write goes into memory, the thread about to fsync hands the whole buffer to the kernel in one write and lets go of the lock, and the next batch fills the buffer, touching no file, while the fsync runs. Reads of a record still in the buffer are answered from it, and it is handed to the kernel past 1 MiB, so a long run of deferred writes holds a bounded amount. The same 1,600 writes now take 200 fsyncs.
 
 `src/resp.rs` is both halves of the protocol, and `minicask::resp::read_reply` is what the test suite uses as a client.
 
@@ -282,6 +295,8 @@ Raft is only safe if a node's term, its vote and the entries it has acknowledged
 
 The log reuses the store's record format, which means its framing, its checksum and its torn-tail recovery are the code the single-node store has already been tested on. A half-written entry is dropped at startup; a flipped bit inside a complete one is reported rather than guessed at.
 
+Writes are batched on the way into the log. Appending means an fsync, under the node's lock, so proposing one write at a time would cap a node at one write per fsync however many clients it has. Instead each write joins a queue, and whoever finds nobody proposing takes the whole queue and proposes it as one batch: one append, one fsync, one message to each follower. Applying committed entries to the store is batched the same way, with one sync of the store for everything a step applied, before the applied index is moved.
+
 A restarted node relearns its commit index from its snapshot onwards, so every committed entry after the snapshot is handed to it again. `applied-index` is what stops it writing those into its store a second time on each restart: entries up to it are skipped. The store is synced before the index is written, never after, so the index cannot claim writes a power cut took away. It is only ever an optimisation, which is why a missing or damaged one is not an error: it falls back to zero, the store is restored from the snapshot, and the entries after it are replayed, which lands in the same state.
 
 ## Testing
@@ -318,7 +333,7 @@ src/bin/        the CLI, the server, and the crash-test helper
 Worth being straight about, since each of these is a design choice rather than an oversight:
 
 - **Keys must fit in memory.** The index is a `HashMap`, so memory scales with key count, not data size.
-- **Single process, single thread.** There is no file lock and no internal synchronisation. Two `Store` instances on one directory will corrupt each other. The server puts one store behind one mutex, which is why it has one.
+- **Single process.** There is no file lock. Two `Store` instances on one directory will corrupt each other. Within one process, reads can share a `Store` across threads and writes need it alone, which is what the server's read-write lock is for.
 - **One store is still one disk.** `minicask-cluster` is the answer to that, and it is a different set of trade-offs rather than a strictly better one: every write costs a network round trip and a majority of fsyncs.
 - **Startup reads every byte.** Recovery verifies the checksum of each record, which means replay is proportional to data size rather than key count. Bitcask solves this with hint files, which would be the next thing to build.
 - **Compaction is stop-the-world.** It blocks until the merge finishes.

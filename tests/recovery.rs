@@ -170,3 +170,73 @@ fn a_fresh_directory_opens_clean() {
     assert!(store.is_empty());
     assert_eq!(store.stats().disk_bytes, 0);
 }
+
+/// A deferred write is visible at once and durable only once synced. The
+/// simulated power cut is what the ordering tests elsewhere lean on, so it
+/// had better lose exactly what a real one would.
+#[test]
+fn a_power_cut_takes_deferred_writes_that_were_never_synced() {
+    let dir = TempDir::new("power-cut-deferred");
+    let mut store = Store::open(dir.path()).unwrap();
+    store.put_deferred(b"synced", b"1").unwrap();
+    store.sync().unwrap();
+    store.put_deferred(b"not-synced", b"2").unwrap();
+    assert_eq!(store.get(b"not-synced").unwrap(), Some(b"2".to_vec()));
+    store.simulate_power_cut().unwrap();
+
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.get(b"synced").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(store.get(b"not-synced").unwrap(), None);
+}
+
+/// `sync` only reaches the active file, so a file must be synced as it is
+/// sealed, or deferred writes that landed in it would never be synced at
+/// all, and a caller that synced afterwards would believe they were safe.
+#[test]
+fn sealing_a_file_makes_its_deferred_writes_durable() {
+    let dir = TempDir::new("power-cut-sealed");
+    let mut store = Store::open_with(
+        dir.path(),
+        Options {
+            max_file_bytes: 512,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let mut sealed_up_to = None;
+    for i in 0..60 {
+        let files = store.stats().files;
+        store
+            .put_deferred(format!("key-{i:02}").as_bytes(), &[b'v'; 40])
+            .unwrap();
+        if store.stats().files > files {
+            // This write started a new file, so everything before it is in
+            // a sealed one.
+            sealed_up_to = Some(i);
+        }
+    }
+    let sealed_up_to = sealed_up_to.expect("the files never rolled over");
+    store.simulate_power_cut().unwrap();
+
+    let store = Store::open(dir.path()).unwrap();
+    for i in 0..sealed_up_to {
+        assert!(
+            store.contains_key(format!("key-{i:02}").as_bytes()),
+            "key-{i:02} was in a sealed file, but the power cut took it"
+        );
+    }
+}
+
+/// Closing a store normally hands its buffer to the kernel, so a deferred
+/// write that was never synced is still there when the store is reopened.
+/// Only a crash or a power cut can take one.
+#[test]
+fn closing_a_store_keeps_its_deferred_writes() {
+    let dir = TempDir::new("close-deferred");
+    {
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put_deferred(b"never-synced", b"kept").unwrap();
+    }
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.get(b"never-synced").unwrap(), Some(b"kept".to_vec()));
+}

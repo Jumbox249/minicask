@@ -69,11 +69,48 @@ pub fn list_data_files(dir: &Path) -> Result<Vec<u64>> {
     Ok(ids)
 }
 
+/// How far an append has to get before it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// The writer's own buffer. Visible to the store's reads at once, and
+    /// handed to the kernel at the next flush or sync, or once the buffer
+    /// passes [`MAX_PENDING`]. Until then it survives neither a crash nor
+    /// a power cut.
+    Buffer,
+    /// The kernel, which survives the process being killed.
+    Kernel,
+    /// The disk, which survives the power going.
+    Disk,
+}
+
+/// Buffered appends are handed to the kernel once they reach this much, so
+/// a long run of them, a snapshot being restored say, holds a bounded
+/// amount in memory.
+pub const MAX_PENDING: usize = 1024 * 1024;
+
 /// The append end of the active data file.
 pub struct LogWriter {
     file: File,
     pub file_id: u64,
+    /// Everything appended, including what is still buffered.
     pub offset: u64,
+    /// How much has been handed to the kernel. Everything after it is in
+    /// `pending`.
+    written: u64,
+    /// How much of the file is known to be on the disk rather than only in
+    /// the kernel's cache. Everything present at open counts, since
+    /// whatever survived to be read back is by definition on the disk.
+    pub synced: u64,
+    /// Appends that have not been handed to the kernel yet.
+    ///
+    /// This is what lets a group commit batch anything at all on NTFS,
+    /// which holds a write to a file until a flush of that same file has
+    /// finished: measured, a 64-byte append took 0.8 microseconds alone
+    /// and half a millisecond beside a flush. Writing into the kernel
+    /// while another thread fsyncs would put every writer behind every
+    /// fsync, one at a time. Buffered here instead, they cost nothing
+    /// while the fsync runs, and go to the kernel together afterwards.
+    pending: Vec<u8>,
 }
 
 impl LogWriter {
@@ -88,28 +125,80 @@ impl LogWriter {
             file,
             file_id,
             offset,
+            written: offset,
+            synced: offset,
+            pending: Vec::new(),
         })
     }
 
-    /// Append one encoded record and return where it landed, fsyncing it
-    /// first if `sync` is set.
-    ///
-    /// The write goes straight to the kernel rather than into a user-space
-    /// buffer, so a reader opening the same file sees the record immediately
-    /// even when it has not been synced.
-    pub fn append(&mut self, bytes: &[u8], sync: bool) -> Result<(u64, u32)> {
+    /// Append one encoded record, take it as far as `reach` says, and
+    /// return where it landed.
+    pub fn append(&mut self, bytes: &[u8], reach: Reach) -> Result<(u64, u32)> {
         let offset = self.offset;
-        self.file.write_all(bytes)?;
-        if sync {
-            self.file.sync_data()?;
+        if reach != Reach::Buffer && self.pending.is_empty() {
+            // Nothing buffered to go first, so no need to copy this through
+            // the buffer on its way to the kernel.
+            self.file.write_all(bytes)?;
+            self.offset += bytes.len() as u64;
+            self.written = self.offset;
+            if reach == Reach::Disk {
+                self.file.sync_data()?;
+                self.synced = self.offset;
+            }
+            return Ok((offset, bytes.len() as u32));
         }
+        self.pending.extend_from_slice(bytes);
         self.offset += bytes.len() as u64;
+        match reach {
+            Reach::Buffer if self.pending.len() < MAX_PENDING => {}
+            Reach::Buffer | Reach::Kernel => self.flush()?,
+            Reach::Disk => self.sync()?,
+        }
         Ok((offset, bytes.len() as u32))
     }
 
-    pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_data()?;
+    /// Hand everything buffered to the kernel, in one write.
+    pub fn flush(&mut self) -> Result<()> {
+        if !self.pending.is_empty() {
+            self.file.write_all(&self.pending)?;
+            self.pending.clear();
+            self.written = self.offset;
+        }
         Ok(())
+    }
+
+    pub fn sync(&mut self) -> Result<()> {
+        self.flush()?;
+        self.file.sync_data()?;
+        self.synced = self.offset;
+        Ok(())
+    }
+
+    /// The bytes of a record that is still buffered, if this one is.
+    pub fn buffered(&self, offset: u64, len: u32) -> Option<&[u8]> {
+        let start = usize::try_from(offset.checked_sub(self.written)?).ok()?;
+        self.pending.get(start..start.checked_add(len as usize)?)
+    }
+
+    /// Forget what is buffered, as a crash would. For
+    /// [`Store::simulate_power_cut`](crate::Store::simulate_power_cut).
+    pub fn discard_buffer(&mut self) {
+        self.pending.clear();
+    }
+
+    /// A second handle on the file, which can fsync it without borrowing
+    /// the writer. It only sees what has been flushed.
+    pub fn try_clone_file(&self) -> Result<File> {
+        Ok(self.file.try_clone()?)
+    }
+}
+
+impl Drop for LogWriter {
+    /// A writer closed normally hands its buffer to the kernel, so that
+    /// buffering is never the difference between a clean shutdown keeping
+    /// a write and losing it.
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 

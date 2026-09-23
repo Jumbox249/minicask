@@ -4,7 +4,9 @@
 //!
 //! Run with: `cargo run --release --example bench`
 
-use minicask::{Options, Store, SyncPolicy};
+use minicask::{Options, Server, Store, SyncPolicy};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::time::Instant;
 
 const VALUE_SIZE: usize = 100;
@@ -30,8 +32,23 @@ fn main() {
         "put (os cache)",
     );
     bench_reads(&dir.join("cached"), 200_000);
-    bench_startup(&dir.join("cached"));
+    bench_startup(&dir.join("cached"), "open (replay every record)");
     bench_compaction(&dir.join("cached"));
+    bench_startup(&dir.join("cached"), "open after compaction");
+
+    println!();
+    bench_server(
+        &dir.join("server-1"),
+        1,
+        2_000,
+        "server SET, 1 client, fsync",
+    );
+    bench_server(
+        &dir.join("server-16"),
+        16,
+        500,
+        "server SET, 16 clients, fsync",
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -76,16 +93,54 @@ fn bench_reads(dir: &std::path::Path, count: usize) {
     assert_eq!(bytes, count * VALUE_SIZE);
 }
 
-fn bench_startup(dir: &std::path::Path) {
+fn bench_startup(dir: &std::path::Path, label: &str) {
     let start = Instant::now();
     let store = Store::open(dir).expect("open");
     let elapsed = start.elapsed();
     println!(
         "{:<34} {:>12} {:>14}",
-        "open (replay every record)",
+        label,
         store.len(),
         format!("{:.0} rec/s", store.len() as f64 / elapsed.as_secs_f64())
     );
+}
+
+/// Clients each sending one `SET` and waiting for its reply before the
+/// next, against a store that syncs every write. With one client that is
+/// an fsync per write whatever the server does; with many, group commit is
+/// what decides whether they share them.
+fn bench_server(dir: &std::path::Path, clients: usize, per_client: usize, label: &str) {
+    let server = Server::bind("127.0.0.1:0", Store::open(dir).expect("open")).expect("bind");
+    let addr = server.local_addr().expect("addr");
+    std::thread::spawn(move || server.run());
+
+    let value = "v".repeat(VALUE_SIZE);
+    let start = Instant::now();
+    let threads: Vec<_> = (0..clients)
+        .map(|c| {
+            let value = value.clone();
+            std::thread::spawn(move || {
+                let mut conn = TcpStream::connect(addr).expect("connect");
+                conn.set_nodelay(true).expect("nodelay");
+                let mut reply = [0u8; 5];
+                for i in 0..per_client {
+                    let key = format!("key-{c:02}-{i:06}");
+                    let command = format!(
+                        "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n${}\r\n{value}\r\n",
+                        key.len(),
+                        value.len()
+                    );
+                    conn.write_all(command.as_bytes()).expect("send");
+                    conn.read_exact(&mut reply).expect("reply");
+                    assert_eq!(&reply, b"+OK\r\n");
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().expect("client");
+    }
+    report(label, clients * per_client, start.elapsed().as_secs_f64());
 }
 
 fn bench_compaction(dir: &std::path::Path) {
