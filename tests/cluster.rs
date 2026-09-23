@@ -455,11 +455,13 @@ fn a_node_down_past_the_compacted_log_is_caught_up_by_snapshot() {
             Reply::ok()
         );
     }
-    let compacted: u64 = c
-        .field(leader, "snapshot_index")
-        .and_then(|v| v.parse().ok())
-        .expect("a snapshot index");
-    assert!(compacted >= 25, "the leader never compacted: {compacted}");
+    // Snapshots are written on a thread of their own, so the latest may
+    // still be landing when the last write is acknowledged.
+    c.poll("the leader to compact past the delete", || {
+        c.field(leader, "snapshot_index")
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&index| index >= 25)
+    });
 
     c.restart(away);
     c.poll("the returning node to catch up", || {
