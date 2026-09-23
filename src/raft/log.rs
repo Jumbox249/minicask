@@ -21,6 +21,7 @@
 //! [`DiskStorage`]: super::DiskStorage
 
 use crate::error::Result;
+use std::io::{Read, Write};
 
 /// Which node in the cluster. Small integers, stable across restarts.
 pub type NodeId = u64;
@@ -84,11 +85,30 @@ pub struct SnapshotMeta {
     pub term: u64,
 }
 
+/// A snapshot being written, a piece at a time.
+///
+/// A snapshot can be as large as the state machine, so nothing insists on
+/// holding one in memory: its bytes are written here as they are produced,
+/// whether that is a node folding its own log or a follower receiving one
+/// from its leader, and it only replaces the current snapshot when handed
+/// to [`Storage::install_snapshot`]. One that is dropped instead leaves no
+/// trace.
+pub trait SnapshotSink: Write + Send {
+    /// What the snapshot being written covers.
+    fn meta(&self) -> SnapshotMeta;
+
+    /// Bytes written so far.
+    fn written(&self) -> u64;
+}
+
 /// Durable storage for one node's consensus state.
 ///
 /// Indices are 1-based, and everything at or below the snapshot's index has
 /// been discarded except the snapshot's own index and term.
 pub trait Storage {
+    /// Where a new snapshot is written before it is installed.
+    type Sink: SnapshotSink;
+
     fn hard_state(&self) -> HardState;
 
     /// Must not return until the state is durable.
@@ -128,7 +148,14 @@ pub trait Storage {
     /// Up to `len` bytes of the snapshot's data, starting at `offset`.
     fn read_snapshot(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
 
-    /// Replace the snapshot with a newer one and drop the entries it
+    /// The whole of the snapshot's data, as a stream.
+    fn snapshot_reader(&self) -> Result<Box<dyn Read + '_>>;
+
+    /// Start writing a snapshot that covers `meta`. Nothing changes until
+    /// the sink is installed.
+    fn new_snapshot(&mut self, meta: SnapshotMeta) -> Result<Self::Sink>;
+
+    /// Replace the snapshot with a finished one and drop the entries it
     /// covers. Must not return until durable.
     ///
     /// If the log holds the snapshot's last entry, at the same term, the
@@ -136,12 +163,20 @@ pub trait Storage {
     /// snapshot. Otherwise the whole log is discarded, because it has
     /// diverged from the snapshot and none of it can be trusted.
     ///
-    /// A snapshot no newer than the current one changes nothing.
-    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<()>;
+    /// A snapshot no newer than the current one changes nothing, and is
+    /// thrown away.
+    fn install_snapshot(&mut self, sink: Self::Sink) -> Result<()>;
 }
 
 /// Convenience queries that every `Storage` gets for free.
 pub trait StorageExt: Storage {
+    /// Write and install a snapshot that is already in hand, all at once.
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<()> {
+        let mut sink = self.new_snapshot(meta)?;
+        sink.write_all(data)?;
+        self.install_snapshot(sink)
+    }
+
     /// The first index still held as an entry.
     fn first_index(&self) -> u64 {
         self.snapshot_meta().index + 1
@@ -202,7 +237,7 @@ pub trait StorageExt: Storage {
     }
 }
 
-impl<S: Storage + ?Sized> StorageExt for S {}
+impl<S: Storage> StorageExt for S {}
 
 /// The in-memory part of a log: the entries after the snapshot, and the
 /// snapshot's index and term standing in for everything before them.
@@ -325,7 +360,37 @@ impl MemStorage {
     }
 }
 
+/// A snapshot for a [`MemStorage`], written into memory.
+#[derive(Debug)]
+pub struct MemSnapshot {
+    meta: SnapshotMeta,
+    data: Vec<u8>,
+}
+
+impl Write for MemSnapshot {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.data.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl SnapshotSink for MemSnapshot {
+    fn meta(&self) -> SnapshotMeta {
+        self.meta
+    }
+
+    fn written(&self) -> u64 {
+        self.data.len() as u64
+    }
+}
+
 impl Storage for MemStorage {
+    type Sink = MemSnapshot;
+
     fn hard_state(&self) -> HardState {
         self.hard_state
     }
@@ -377,9 +442,20 @@ impl Storage for MemStorage {
         Ok(self.snapshot[start..end].to_vec())
     }
 
-    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<()> {
-        if self.log.compact(meta) {
-            self.snapshot = data.to_vec();
+    fn snapshot_reader(&self) -> Result<Box<dyn Read + '_>> {
+        Ok(Box::new(&self.snapshot[..]))
+    }
+
+    fn new_snapshot(&mut self, meta: SnapshotMeta) -> Result<MemSnapshot> {
+        Ok(MemSnapshot {
+            meta,
+            data: Vec::new(),
+        })
+    }
+
+    fn install_snapshot(&mut self, sink: MemSnapshot) -> Result<()> {
+        if self.log.compact(sink.meta) {
+            self.snapshot = sink.data;
         }
         Ok(())
     }

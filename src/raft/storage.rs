@@ -19,6 +19,12 @@
 //! index and term; its value is the command, with a tombstone flag
 //! standing in for the no-op that carries none.
 //!
+//! A snapshot is never held in memory whole. One being written, whether
+//! taken here or arriving from a leader, goes into a `snapshot.part-N`
+//! file beside the real one and is renamed over it once complete and
+//! synced, so a crash part way through leaves the old snapshot in place
+//! and a stray part file that the next open deletes.
+//!
 //! Taking a snapshot touches two files, and no filesystem changes two
 //! files at once. The snapshot is written first and the entries file
 //! rewritten second, so a crash in between leaves a snapshot beside a log
@@ -28,12 +34,12 @@
 //!
 //! [`MemStorage`]: super::MemStorage
 
-use super::log::{Command, Entry, EntryLog, HardState, SnapshotMeta, Storage};
-use crate::crc::crc32_parts;
+use super::log::{Command, Entry, EntryLog, HardState, SnapshotMeta, SnapshotSink, Storage};
+use crate::crc::{crc32_parts, Crc32};
 use crate::error::{Error, Result};
 use crate::record::{self, Header, HEADER_LEN};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const HARD_STATE_LEN: usize = 20;
@@ -60,6 +66,9 @@ pub struct DiskStorage {
     offsets: Vec<u64>,
     end: u64,
     snapshot_len: u64,
+    /// Numbers the part files of snapshots being written, so that two at
+    /// once, one taken here and one arriving, never share a file.
+    next_part: u64,
 }
 
 impl DiskStorage {
@@ -71,6 +80,7 @@ impl DiskStorage {
 
         let hard_state = read_hard_state(&dir.join("hard-state"))?;
         let (base, snapshot_len) = read_snapshot_header(&dir)?;
+        remove_stray_parts(&dir)?;
 
         let mut entries_file = OpenOptions::new()
             .read(true)
@@ -88,6 +98,7 @@ impl DiskStorage {
             offsets,
             end,
             snapshot_len,
+            next_part: 0,
         };
 
         match entries.first().map(|e| e.index) {
@@ -168,7 +179,83 @@ impl DiskStorage {
     }
 }
 
+/// A snapshot on its way to disk: a part file with room left at the front
+/// for the header, whose checksum is only known once the last byte is in.
+pub struct DiskSnapshot {
+    meta: SnapshotMeta,
+    /// `None` once installed, which is how `Drop` knows to leave it be.
+    file: Option<BufWriter<File>>,
+    path: PathBuf,
+    crc: Crc32,
+    written: u64,
+}
+
+impl Write for DiskSnapshot {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let file = self.file.as_mut().expect("written after install");
+        let n = file.write(buf)?;
+        self.crc.update(&buf[..n]);
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.as_mut().expect("flushed after install").flush()
+    }
+}
+
+impl SnapshotSink for DiskSnapshot {
+    fn meta(&self) -> SnapshotMeta {
+        self.meta
+    }
+
+    fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl Drop for DiskSnapshot {
+    /// A snapshot abandoned part way, because a newer one overtook it or
+    /// its leader moved on, takes its part file with it.
+    fn drop(&mut self) {
+        if self.file.take().is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl DiskSnapshot {
+    /// Fill in the header, sync, and hand back the finished part file's
+    /// path, closed, ready to be renamed.
+    fn finish(mut self) -> Result<PathBuf> {
+        let mut file = self
+            .file
+            .take()
+            .expect("finished twice")
+            .into_inner()
+            .map_err(|e| e.into_error())?;
+        let header = snapshot_header(self.meta, self.crc);
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header)?;
+        file.sync_all()?;
+        Ok(std::mem::take(&mut self.path))
+    }
+}
+
+/// The snapshot file's header: the checksum of everything after it, then
+/// the index and term it covers. `crc` has already seen the data, and the
+/// index and term were fed to it first.
+fn snapshot_header(meta: SnapshotMeta, crc: Crc32) -> [u8; SNAPSHOT_HEADER_LEN as usize] {
+    let mut header = [0u8; SNAPSHOT_HEADER_LEN as usize];
+    header[0..4].copy_from_slice(&crc.finish().to_le_bytes());
+    header[4..12].copy_from_slice(&meta.index.to_le_bytes());
+    header[12..20].copy_from_slice(&meta.term.to_le_bytes());
+    header
+}
+
 impl Storage for DiskStorage {
+    type Sink = DiskSnapshot;
+
     fn hard_state(&self) -> HardState {
         self.hard_state
     }
@@ -266,27 +353,71 @@ impl Storage for DiskStorage {
         Ok(buf)
     }
 
-    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> Result<()> {
+    fn snapshot_reader(&self) -> Result<Box<dyn Read + '_>> {
+        let mut file = File::open(self.dir.join("snapshot"))?;
+        file.seek(SeekFrom::Start(SNAPSHOT_HEADER_LEN))?;
+        Ok(Box::new(
+            BufReader::with_capacity(64 * 1024, file).take(self.snapshot_len),
+        ))
+    }
+
+    fn new_snapshot(&mut self, meta: SnapshotMeta) -> Result<DiskSnapshot> {
+        self.next_part += 1;
+        let path = self.dir.join(format!("snapshot.part-{}", self.next_part));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        // Room for the header, which is written last.
+        file.write_all(&[0u8; SNAPSHOT_HEADER_LEN as usize])?;
+        let mut crc = Crc32::new();
+        crc.update(&meta.index.to_le_bytes());
+        crc.update(&meta.term.to_le_bytes());
+        Ok(DiskSnapshot {
+            meta,
+            file: Some(BufWriter::with_capacity(64 * 1024, file)),
+            path,
+            crc,
+            written: 0,
+        })
+    }
+
+    fn install_snapshot(&mut self, sink: DiskSnapshot) -> Result<()> {
+        let meta = sink.meta;
         if meta.index <= self.log.base().index {
+            // Dropping it removes its part file.
             return Ok(());
         }
+        let len = sink.written;
 
         // The snapshot first, so that the moment the old entries are gone
         // there is already something durable standing in for them.
-        let mut body = Vec::with_capacity(16 + data.len());
-        body.extend_from_slice(&meta.index.to_le_bytes());
-        body.extend_from_slice(&meta.term.to_le_bytes());
-        body.extend_from_slice(data);
-        let mut file = Vec::with_capacity(4 + body.len());
-        file.extend_from_slice(&crc32_parts(&[&body]).to_le_bytes());
-        file.extend_from_slice(&body);
-        crate::log::write_atomically(&self.dir, "snapshot", &file)?;
-        self.snapshot_len = data.len() as u64;
+        let part = sink.finish()?;
+        std::fs::rename(&part, self.dir.join("snapshot"))?;
+        crate::log::sync_dir(&self.dir)?;
+        self.snapshot_len = len;
 
         // Then the log, cut down to what follows the snapshot.
         self.log.compact(meta);
         self.rewrite_entries()
     }
+}
+
+/// Part files are snapshots that were being written when the process
+/// stopped. None of them was installed, so none of them is needed.
+fn remove_stray_parts(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // `snapshot.tmp` is where earlier versions wrote a snapshot before
+        // renaming it into place.
+        if name.starts_with("snapshot.part-") || name == "snapshot.tmp" {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// An entry's key is its index and term, so a recovered record describes
@@ -314,9 +445,12 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
 /// No file means no snapshot. A file that is there but wrong is not the
 /// same thing at all: the entries it stood in for may already be gone, so
 /// treating it as absent would quietly throw committed writes away.
+///
+/// The file is read through once to check it, a piece at a time, since it
+/// is as large as the state machine.
 fn read_snapshot_header(dir: &Path) -> Result<(SnapshotMeta, u64)> {
-    let bytes = match std::fs::read(dir.join("snapshot")) {
-        Ok(bytes) => bytes,
+    let file = match File::open(dir.join("snapshot")) {
+        Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok((SnapshotMeta::default(), 0)),
         Err(e) => return Err(e.into()),
     };
@@ -325,19 +459,38 @@ fn read_snapshot_header(dir: &Path) -> Result<(SnapshotMeta, u64)> {
         offset: 0,
         detail,
     };
-    if (bytes.len() as u64) < SNAPSHOT_HEADER_LEN {
-        return Err(corrupt("the raft snapshot is shorter than its header"));
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut header = [0u8; SNAPSHOT_HEADER_LEN as usize];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+            return Err(corrupt("the raft snapshot is shorter than its header"))
+        }
+        Err(e) => return Err(e.into()),
     }
-    let expected = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
-    if crc32_parts(&[&bytes[4..]]) != expected {
+    let expected = u32::from_le_bytes(header[0..4].try_into().expect("four bytes"));
+    let index = u64::from_le_bytes(header[4..12].try_into().expect("eight bytes"));
+    let term = u64::from_le_bytes(header[12..20].try_into().expect("eight bytes"));
+
+    let mut crc = Crc32::new();
+    crc.update(&header[4..]);
+    let mut len = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                crc.update(&buf[..n]);
+                len += n as u64;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if crc.finish() != expected {
         return Err(corrupt("checksum mismatch in the raft snapshot"));
     }
-    let index = u64::from_le_bytes(bytes[4..12].try_into().expect("eight bytes"));
-    let term = u64::from_le_bytes(bytes[12..20].try_into().expect("eight bytes"));
-    Ok((
-        SnapshotMeta { index, term },
-        bytes.len() as u64 - SNAPSHOT_HEADER_LEN,
-    ))
+    Ok((SnapshotMeta { index, term }, len))
 }
 
 /// Read the log back, stopping at the first record that a crash could have
@@ -899,5 +1052,75 @@ mod tests {
         storage.save_snapshot(meta(1, 1), b"older").unwrap();
         assert_eq!(storage.snapshot_meta(), meta(2, 1));
         assert_eq!(storage.read_snapshot(0, 10).unwrap(), b"newer");
+    }
+
+    fn part_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("snapshot.part-"))
+            .collect()
+    }
+
+    /// A snapshot that is started and then given up on, because its leader
+    /// moved on or a newer one overtook it, takes its part file with it.
+    #[test]
+    fn an_abandoned_snapshot_leaves_nothing_behind() {
+        let dir = Dir::new("snap-abandoned");
+        let mut storage = DiskStorage::open(&dir.0).unwrap();
+        let mut sink = storage.new_snapshot(meta(3, 1)).unwrap();
+        sink.write_all(b"half a snapshot").unwrap();
+        assert_eq!(part_files(&dir.0).len(), 1);
+        drop(sink);
+        assert!(part_files(&dir.0).is_empty(), "the part file outlived it");
+        assert_eq!(storage.snapshot_meta(), SnapshotMeta::default());
+    }
+
+    /// What a crash in the middle of writing one leaves behind. It was
+    /// never installed, so it goes, and the snapshot beside it stays.
+    #[test]
+    fn a_part_file_left_by_a_crash_is_cleared_on_open() {
+        let dir = Dir::new("snap-stray");
+        {
+            let mut storage = DiskStorage::open(&dir.0).unwrap();
+            storage.append(&entries(&[(1, 1), (2, 1)])).unwrap();
+            storage.save_snapshot(meta(2, 1), b"kept").unwrap();
+            let mut sink = storage.new_snapshot(meta(9, 1)).unwrap();
+            sink.write_all(b"interrupted").unwrap();
+            sink.flush().unwrap();
+            // A crash: nothing gets to run the sink's cleanup.
+            std::mem::forget(sink);
+        }
+        assert_eq!(part_files(&dir.0).len(), 1);
+
+        let storage = DiskStorage::open(&dir.0).unwrap();
+        assert!(part_files(&dir.0).is_empty());
+        assert_eq!(storage.snapshot_meta(), meta(2, 1));
+        assert_eq!(storage.read_snapshot(0, 10).unwrap(), b"kept");
+    }
+
+    /// Reading the snapshot back as a stream sees exactly what was written,
+    /// however it was written.
+    #[test]
+    fn a_snapshot_written_in_pieces_reads_back_whole() {
+        let dir = Dir::new("snap-pieces");
+        let mut storage = DiskStorage::open(&dir.0).unwrap();
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+        let mut sink = storage.new_snapshot(meta(4, 2)).unwrap();
+        for piece in data.chunks(7_777) {
+            sink.write_all(piece).unwrap();
+        }
+        storage.install_snapshot(sink).unwrap();
+        drop(storage);
+
+        // Reopening checks the checksum over the whole file.
+        let storage = DiskStorage::open(&dir.0).unwrap();
+        let mut back = Vec::new();
+        storage
+            .snapshot_reader()
+            .unwrap()
+            .read_to_end(&mut back)
+            .unwrap();
+        assert_eq!(back, data);
     }
 }

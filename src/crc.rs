@@ -37,6 +37,24 @@ pub fn crc32_parts(parts: &[&[u8]]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
+/// A checksum fed a piece at a time, for data too large to hold at once.
+#[derive(Debug, Clone, Copy)]
+pub struct Crc32(u32);
+
+impl Crc32 {
+    pub fn new() -> Crc32 {
+        Crc32(0xFFFF_FFFF)
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.0 = update(self.0, data);
+    }
+
+    pub fn finish(self) -> u32 {
+        self.0 ^ 0xFFFF_FFFF
+    }
+}
+
 fn update(mut crc: u32, data: &[u8]) -> u32 {
     for &byte in data {
         let idx = ((crc ^ byte as u32) & 0xFF) as usize;
@@ -70,5 +88,20 @@ mod tests {
         let joined = crc32(b"hello world");
         assert_eq!(crc32_parts(&[b"hello ", b"world"]), joined);
         assert_eq!(crc32_parts(&[b"h", b"ello wor", b"ld"]), joined);
+    }
+
+    #[test]
+    fn a_running_checksum_matches_the_one_shot() {
+        let mut running = Crc32::new();
+        for piece in [
+            &b"The quick "[..],
+            b"brown fox",
+            b"",
+            b" jumps over the lazy dog",
+        ] {
+            running.update(piece);
+        }
+        assert_eq!(running.finish(), 0x414F_A339);
+        assert_eq!(Crc32::new().finish(), 0);
     }
 }

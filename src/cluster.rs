@@ -16,6 +16,10 @@
 //! The lock is the same trade the single-node server makes. A command holds
 //! it for one append or one read, and consensus is a network round trip
 //! anyway, so the mutex is not what limits throughput here.
+//!
+//! The one long job, writing a snapshot, happens off the lock: the ticker
+//! starts it, a thread of its own writes it from a point-in-time view of
+//! the store, and the lock is only taken again to install the result.
 
 use crate::error::Result;
 use crate::raft::{wire, Action, Config, DiskStorage, Message, Node, NodeId, ProposeError, Role};
@@ -110,13 +114,7 @@ impl Shared {
             let mut replica = self.lock();
             match replica.step(from, message) {
                 Ok(actions) => actions,
-                Err(e) => {
-                    // A storage failure here means the log could not be
-                    // made durable, and continuing would mean
-                    // acknowledging what is not on disk.
-                    eprintln!("minicask-cluster: consensus storage failed: {e}");
-                    std::process::abort();
-                }
+                Err(e) => storage_failed(&e),
             }
         };
         self.progress.notify_all();
@@ -160,6 +158,7 @@ impl ClusterNode {
         let node = Node::new(config.id, config.ids(), config.raft, storage);
         let mut replica = ReplicatedStore::new(node, store)?;
         replica.set_snapshot_every(config.snapshot_every);
+        replica.set_background_snapshots(true);
 
         let raft_listener = TcpListener::bind(raft_addr)?;
         let client_listener = TcpListener::bind(client_addr)?;
@@ -235,19 +234,63 @@ impl ClusterNode {
 fn ticker(shared: &Arc<Shared>, tick: Duration) {
     loop {
         thread::sleep(tick);
-        let actions = {
+        let (actions, job) = {
             let mut replica = shared.lock();
-            match replica.tick() {
+            let actions = match replica.tick() {
                 Ok(actions) => actions,
+                Err(e) => storage_failed(&e),
+            };
+            let job = match replica.start_snapshot() {
+                Ok(job) => job,
                 Err(e) => {
-                    eprintln!("minicask-cluster: consensus storage failed: {e}");
-                    std::process::abort();
+                    // A snapshot that cannot be started costs a longer log,
+                    // not correctness. Try again once more has been applied.
+                    eprintln!("minicask-cluster: could not start a snapshot: {e}");
+                    None
                 }
-            }
+            };
+            (actions, job)
         };
         shared.progress.notify_all();
         shared.dispatch(actions);
+
+        if let Some(job) = job {
+            let writer = Arc::clone(shared);
+            let spawned = thread::Builder::new()
+                .name("snapshot".to_string())
+                .spawn(move || write_snapshot(&writer, job));
+            if spawned.is_err() {
+                // The job went down with the thread that never started.
+                shared.lock().abandon_snapshot();
+            }
+        }
     }
+}
+
+/// Write a snapshot without the lock, then take it just long enough to
+/// install the result.
+fn write_snapshot(shared: &Shared, job: crate::replicated::SnapshotJob<crate::raft::DiskSnapshot>) {
+    let index = job.index();
+    let written = job.run();
+    let mut replica = shared.lock();
+    match written {
+        Ok(sink) => {
+            if let Err(e) = replica.finish_snapshot(sink) {
+                storage_failed(&e);
+            }
+        }
+        Err(e) => {
+            eprintln!("minicask-cluster: writing the snapshot at {index} failed: {e}");
+            replica.abandon_snapshot();
+        }
+    }
+}
+
+/// A storage failure means the log could not be made durable, and
+/// continuing would mean acknowledging what is not on disk.
+fn storage_failed(e: &crate::Error) -> ! {
+    eprintln!("minicask-cluster: consensus storage failed: {e}");
+    std::process::abort();
 }
 
 fn accept_peers(shared: &Arc<Shared>, listener: &TcpListener) {

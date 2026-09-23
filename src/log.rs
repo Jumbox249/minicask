@@ -74,11 +74,10 @@ pub struct LogWriter {
     file: File,
     pub file_id: u64,
     pub offset: u64,
-    sync: SyncPolicy,
 }
 
 impl LogWriter {
-    pub fn open(dir: &Path, file_id: u64, sync: SyncPolicy) -> Result<Self> {
+    pub fn open(dir: &Path, file_id: u64) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -89,19 +88,19 @@ impl LogWriter {
             file,
             file_id,
             offset,
-            sync,
         })
     }
 
-    /// Append one encoded record and return where it landed.
+    /// Append one encoded record and return where it landed, fsyncing it
+    /// first if `sync` is set.
     ///
     /// The write goes straight to the kernel rather than into a user-space
     /// buffer, so a reader opening the same file sees the record immediately
-    /// even when `SyncPolicy::OsCache` is in force.
-    pub fn append(&mut self, bytes: &[u8]) -> Result<(u64, u32)> {
+    /// even when it has not been synced.
+    pub fn append(&mut self, bytes: &[u8], sync: bool) -> Result<(u64, u32)> {
         let offset = self.offset;
         self.file.write_all(bytes)?;
-        if self.sync == SyncPolicy::EveryWrite {
+        if sync {
             self.file.sync_data()?;
         }
         self.offset += bytes.len() as u64;
@@ -111,13 +110,6 @@ impl LogWriter {
     pub fn sync(&mut self) -> Result<()> {
         self.file.sync_data()?;
         Ok(())
-    }
-
-    /// Change the durability policy of an open writer. Compaction uses this
-    /// to merge under `OsCache` and fsync once at the end, then hand the
-    /// writer back with the store's real policy restored.
-    pub fn set_sync(&mut self, sync: SyncPolicy) {
-        self.sync = sync;
     }
 }
 

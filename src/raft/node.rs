@@ -6,10 +6,13 @@
 //! a function of the state and the input, which is what lets the test
 //! harness partition a cluster and kill leaders without a single sleep.
 
-use super::log::{Command, Entry, HardState, NodeId, SnapshotMeta, Storage, StorageExt};
+use super::log::{
+    Command, Entry, HardState, NodeId, SnapshotMeta, SnapshotSink, Storage, StorageExt,
+};
 use super::message::{Action, Message};
 use crate::error::Result;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 
 /// Which of the three states a node is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +178,8 @@ pub struct Node<S: Storage> {
     /// Follower only: a snapshot arriving in pieces, and who is sending it.
     /// Pieces from two leaders are never spliced, even for the same index:
     /// both describe the same state, but nothing promises the same bytes.
-    incoming: Option<(NodeId, SnapshotMeta, Vec<u8>)>,
+    /// The pieces go straight to storage as they arrive.
+    incoming: Option<(NodeId, S::Sink)>,
     next_index: HashMap<NodeId, u64>,
     match_index: HashMap<NodeId, u64>,
 
@@ -330,14 +334,43 @@ impl<S: Storage> Node<S> {
     /// for an index that is not applied yet, or not past the current
     /// snapshot, does nothing.
     pub fn compact(&mut self, index: u64, data: &[u8]) -> Result<bool> {
-        if index <= self.storage.snapshot_meta().index || index > self.last_applied {
-            return Ok(false);
-        }
-        let Some(term) = self.storage.term_at(index) else {
+        let Some(mut sink) = self.begin_compaction(index)? else {
             return Ok(false);
         };
-        self.storage
-            .save_snapshot(SnapshotMeta { index, term }, data)?;
+        sink.write_all(data)?;
+        self.finish_compaction(sink)
+    }
+
+    /// The first half of [`compact`](Node::compact), for a snapshot too
+    /// large to build in memory: a sink to write the state as of `index`
+    /// into, or `None` if `index` cannot be snapshotted.
+    ///
+    /// The node carries on while the sink is being written, so the caller
+    /// can write it without holding up consensus, provided what it writes
+    /// is the state as of `index` and not whatever the state has become
+    /// since.
+    pub fn begin_compaction(&mut self, index: u64) -> Result<Option<S::Sink>> {
+        if index <= self.storage.snapshot_meta().index || index > self.last_applied {
+            return Ok(None);
+        }
+        let Some(term) = self.storage.term_at(index) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.storage.new_snapshot(SnapshotMeta { index, term })?,
+        ))
+    }
+
+    /// Install a snapshot written from [`begin_compaction`](Node::begin_compaction)
+    /// and discard the log it covers. Returns false, and discards the
+    /// snapshot instead, if a newer one was installed in the meantime,
+    /// which happens when a leader sent one while this one was being
+    /// written.
+    pub fn finish_compaction(&mut self, sink: S::Sink) -> Result<bool> {
+        if sink.meta().index <= self.storage.snapshot_meta().index {
+            return Ok(false);
+        }
+        self.storage.install_snapshot(sink)?;
         Ok(true)
     }
 
@@ -1035,7 +1068,7 @@ impl<S: Storage> Node<S> {
 
         let continuing = matches!(
             &self.incoming,
-            Some((sender, m, _)) if *sender == from && *m == meta
+            Some((sender, sink)) if *sender == from && sink.meta() == meta
         );
         if !continuing {
             if offset != 0 {
@@ -1044,26 +1077,27 @@ impl<S: Storage> Node<S> {
                 actions.push(reply(0, false));
                 return Ok(());
             }
-            self.incoming = Some((from, meta, Vec::new()));
+            // Replacing an unfinished one drops it, and its part with it.
+            self.incoming = Some((from, self.storage.new_snapshot(meta)?));
         }
 
-        let (_, _, buf) = self.incoming.as_mut().expect("just ensured");
-        let held = buf.len() as u64;
+        let (_, sink) = self.incoming.as_mut().expect("just ensured");
+        let held = sink.written();
         if offset != held {
             // A gap, or a piece already seen. Either way, say where this
             // node has got to and let the leader carry on from there.
             actions.push(reply(held, false));
             return Ok(());
         }
-        buf.extend_from_slice(&data);
-        let held = buf.len() as u64;
+        sink.write_all(&data)?;
+        let held = sink.written();
         if !done {
             actions.push(reply(held, false));
             return Ok(());
         }
 
-        let (_, meta, data) = self.incoming.take().expect("just used");
-        self.storage.save_snapshot(meta, &data)?;
+        let (_, sink) = self.incoming.take().expect("just used");
+        self.storage.install_snapshot(sink)?;
         // The snapshot is applied state, so the state machine must pick it
         // up rather than wait for entries that no longer exist.
         self.commit_index = self.commit_index.max(meta.index);
@@ -1991,6 +2025,34 @@ mod tests {
             "no newer than what is there"
         );
         assert_eq!(node.storage().first_index(), 3);
+    }
+
+    /// A snapshot is written while the node carries on, so a leader can
+    /// install a newer one in the meantime. The older one must not then
+    /// replace it.
+    #[test]
+    fn a_compaction_overtaken_by_an_installed_snapshot_is_dropped() {
+        let mut node = follower(1, &[(1, 1), (2, 1), (3, 1)]);
+        node.step(9, append(1, (3, 1), &[], 3)).unwrap();
+        node.take_committed();
+
+        let mut ours = node
+            .begin_compaction(2)
+            .unwrap()
+            .expect("index 2 is applied");
+        ours.write_all(b"ours, as of 2").unwrap();
+
+        node.step(9, install(1, snap(5, 1), 0, b"theirs, as of 5", true))
+            .unwrap();
+        assert!(
+            !node.finish_compaction(ours).unwrap(),
+            "an older snapshot was reported as installed"
+        );
+        assert_eq!(node.storage().snapshot_meta(), snap(5, 1));
+        assert_eq!(
+            node.storage().read_snapshot(0, 100).unwrap(),
+            b"theirs, as of 5"
+        );
     }
 
     /// The leader's half: a follower that needs what the leader has folded

@@ -212,11 +212,13 @@ A follower that needs entries the leader has already folded away is sent the sna
 
 Installing one is where the obvious approach is wrong. Writing the snapshot's keys into the store is not enough, because a key this node still holds but the cluster deleted while it was away is simply *absent* from the snapshot, and would survive. So the store is made exactly the snapshot: everything it does not contain is deleted first. There is a test that deletes a key while a follower is cut off, compacts past the delete so it can only arrive by snapshot, and requires the key to be gone.
 
+None of it holds the store in memory. A snapshot is written from a point-in-time view of the store: a copy of its index as of one applied entry, which costs memory per key but none per value. Because nothing in the store is ever overwritten, a write that lands after the view was taken appends somewhere new and leaves the records the view points at where they were, so the view can be read on a thread of its own while the node carries on. The node's lock is held only to take the view and, at the end, to install the result. Sending reads the snapshot file a piece at a time, a follower writes each piece to disk as it arrives, and a restore streams the snapshot back one record at a time, walking it in step with the store's own keys in sorted order so it can find the stale ones without holding either side in memory.
+
 Taking a snapshot changes two files, and a crash can land between them. The snapshot is always written before the log is cut down, and opening a directory finishes whichever half was interrupted by the same rule that taking the snapshot applies: if the log agrees with the snapshot at its last entry, the entries after it are kept, and otherwise none of them are. Restoring the store is interruptible too, because the store's applied index only moves once the restore is on disk; a crash part way leaves the snapshot ahead of the store, and the next start restores it again.
 
 ### What it does not do yet
 
-- **Snapshots are built in memory.** Taking one, sending one and restoring one each need room for the store's whole contents at once, and the node holds its lock while it takes one. A snapshot streamed from a point-in-time view of the store would lift both.
+- **Store compaction still holds the lock.** When a snapshot finds more than half the store is dead records it compacts the store, and that rewrites every live record while consensus waits. It happens at most once per snapshot. Restoring a snapshot also holds the lock, on a follower that is not serving anything until it is done.
 - **Fixed membership.** Adding or removing a node means restarting the cluster.
 - **Reads go to the leader**, so followers are redundancy and not read capacity.
 
@@ -262,6 +264,7 @@ n1/
     hard-state     term and vote, written to one side and renamed over the other
     entries        the log after the snapshot, append-only, same record format as the store
     snapshot       the store as of some index, checksummed, replaced whole
+    snapshot.part-N  one being written or received; renamed into place, or deleted on the next start
 ```
 
 Raft is only safe if a node's term, its vote and the entries it has acknowledged are on the platter before it replies, so every one of those writes is fsynced. That is not a tunable. `--no-fsync` exists for a single node that has chosen speed over a power cut; a node that acknowledges what it has not stored can lose a committed write, which is the one thing consensus exists to prevent.

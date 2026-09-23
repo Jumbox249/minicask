@@ -161,7 +161,7 @@ impl Store {
         }
 
         let active_id = newest.unwrap_or(1);
-        let writer = LogWriter::open(&dir, active_id, opts.sync)?;
+        let writer = LogWriter::open(&dir, active_id)?;
         readers
             .entry(active_id)
             .or_insert(File::open(data_file_path(&dir, active_id))?);
@@ -179,9 +179,25 @@ impl Store {
 
     /// Store a value, replacing any previous one for this key.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let sync = self.opts.sync == SyncPolicy::EveryWrite;
+        self.put_with(key, value, sync)
+    }
+
+    /// Store a value without waiting for it to reach the disk, whatever the
+    /// sync policy. It is visible to reads at once, and durable after the
+    /// next [`sync`](Store::sync).
+    ///
+    /// For a caller that writes many records and needs them durable as a
+    /// batch rather than one at a time: one fsync for the lot instead of
+    /// one each.
+    pub fn put_deferred(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_with(key, value, false)
+    }
+
+    fn put_with(&mut self, key: &[u8], value: &[u8], sync: bool) -> Result<()> {
         let bytes = record::encode(key, Some(value), record::now_millis())?;
         self.roll_if_needed(bytes.len() as u64)?;
-        let (offset, len) = self.writer.append(&bytes)?;
+        let (offset, len) = self.writer.append(&bytes, sync)?;
 
         self.disk_bytes += len as u64;
         if let Some(old) = self.keydir.remove(key) {
@@ -215,12 +231,23 @@ impl Store {
     /// Deletion appends a tombstone rather than erasing anything, so the
     /// space comes back at the next compaction, not immediately.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        let sync = self.opts.sync == SyncPolicy::EveryWrite;
+        self.delete_with(key, sync)
+    }
+
+    /// Remove a key without waiting for the tombstone to reach the disk.
+    /// See [`put_deferred`](Store::put_deferred).
+    pub fn delete_deferred(&mut self, key: &[u8]) -> Result<bool> {
+        self.delete_with(key, false)
+    }
+
+    fn delete_with(&mut self, key: &[u8], sync: bool) -> Result<bool> {
         if !self.keydir.contains_key(key) {
             return Ok(false);
         }
         let bytes = record::encode(key, None, record::now_millis())?;
         self.roll_if_needed(bytes.len() as u64)?;
-        let (_, len) = self.writer.append(&bytes)?;
+        let (_, len) = self.writer.append(&bytes, sync)?;
 
         self.disk_bytes += len as u64;
         if let Some(old) = self.keydir.remove(key) {
@@ -284,7 +311,7 @@ impl Store {
         // from an fsync per record: a single sync once the whole merged file
         // is written is the barrier that matters, and it has to happen before
         // any of the originals are unlinked.
-        let mut writer = LogWriter::open(&self.dir, merged_id, SyncPolicy::OsCache)?;
+        let mut writer = LogWriter::open(&self.dir, merged_id)?;
         let mut merged: HashMap<Vec<u8>, Location> = HashMap::with_capacity(entries.len());
         let mut merged_bytes = 0u64;
 
@@ -297,7 +324,7 @@ impl Store {
             // Copying the encoded bytes verbatim keeps each record's original
             // checksum and timestamp intact.
             let bytes = log::read_at(file, loc.offset, loc.len)?;
-            let (offset, len) = writer.append(&bytes)?;
+            let (offset, len) = writer.append(&bytes, false)?;
             merged_bytes += len as u64;
             merged.insert(
                 key,
@@ -310,7 +337,6 @@ impl Store {
             );
         }
         writer.sync()?;
-        writer.set_sync(self.opts.sync);
 
         // The merged file is durable now, so the originals are safe to drop.
         for id in &old_ids {
@@ -335,15 +361,65 @@ impl Store {
         })
     }
 
+    /// The store as it stands right now, readable without the store.
+    ///
+    /// This works because nothing on disk is ever overwritten: a write
+    /// after this point appends a new record somewhere else and leaves the
+    /// one the view points at where it was. The view keeps a copy of the
+    /// index, so it costs memory per key but none per value, and its own
+    /// file handles, so it can be read on another thread while the store
+    /// carries on taking writes.
+    ///
+    /// The one thing that would pull records out from under it is a
+    /// [`compact`](Store::compact), which deletes the files they are in.
+    /// Deleting a file that is open is allowed everywhere this runs (Rust
+    /// opens files on Windows with delete sharing), and the view's handles
+    /// keep the data readable until they close, but the caller that owns
+    /// the store is still better off not compacting while a view is out.
+    pub(crate) fn view(&self) -> Result<StoreView> {
+        let mut entries: Vec<(Vec<u8>, Location)> =
+            self.keydir.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut readers = HashMap::with_capacity(self.readers.len());
+        for &id in self.readers.keys() {
+            readers.insert(id, File::open(data_file_path(&self.dir, id))?);
+        }
+        Ok(StoreView { entries, readers })
+    }
+
     /// Start a new data file once the active one has grown past the limit.
     fn roll_if_needed(&mut self, incoming: u64) -> Result<()> {
         if self.writer.offset == 0 || self.writer.offset + incoming <= self.opts.max_file_bytes {
             return Ok(());
         }
+        // Whatever was written to the file being sealed without a sync gets
+        // one now: `sync` only ever reaches the active file, so after this
+        // point nothing would.
+        self.writer.sync()?;
         let next_id = self.writer.file_id + 1;
-        self.writer = LogWriter::open(&self.dir, next_id, self.opts.sync)?;
+        self.writer = LogWriter::open(&self.dir, next_id)?;
         self.readers
             .insert(next_id, File::open(data_file_path(&self.dir, next_id))?);
+        Ok(())
+    }
+}
+
+/// A frozen copy of a store's index, and the files it points into. See
+/// [`Store::view`].
+pub(crate) struct StoreView {
+    /// In key order, so that walking a view is deterministic.
+    entries: Vec<(Vec<u8>, Location)>,
+    readers: HashMap<u64, File>,
+}
+
+impl StoreView {
+    /// Every live key and its value, in key order, one value in memory at
+    /// a time.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()> {
+        for (key, loc) in &self.entries {
+            let value = read_value(&self.readers, loc)?;
+            f(key, &value)?;
+        }
         Ok(())
     }
 }

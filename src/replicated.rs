@@ -22,13 +22,21 @@
 //! records, one per live key, so it is checksummed per record the same way
 //! everything else is. A follower too far behind for the leader to send it
 //! entries is sent the snapshot instead, and its store is replaced by it.
+//!
+//! None of that holds the store in memory. A snapshot is written from a
+//! [`view`](crate::Store) of the store, a copy of its index as of one
+//! applied entry, one value at a time, and it can be written on another
+//! thread while this one carries on applying: see [`SnapshotJob`]. A
+//! restore reads the snapshot back the same way.
 
 use crate::crc::crc32_parts;
 use crate::error::{Error, Result};
-use crate::raft::{Accepted, Action, Command, Message, Node, NodeId, ProposeError, Role, Storage};
+use crate::raft::{
+    Accepted, Action, Command, Message, Node, NodeId, ProposeError, Role, SnapshotSink, Storage,
+};
 use crate::record::{self, Header, HEADER_LEN};
-use crate::store::Store;
-use std::collections::HashMap;
+use crate::store::{Store, StoreView};
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// Applied entries between snapshots, by default. Small enough that a log
@@ -111,6 +119,39 @@ pub struct ReplicatedStore<S: Storage> {
     store: Store,
     applied: u64,
     snapshot_every: u64,
+    /// Whether snapshots are left to the caller, via
+    /// [`start_snapshot`](Self::start_snapshot), rather than taken inline.
+    background_snapshots: bool,
+    /// A snapshot job is out and has not been finished or abandoned.
+    snapshotting: bool,
+}
+
+/// A snapshot being taken: the store as of one applied index, and the sink
+/// it is being written into.
+///
+/// It holds nothing borrowed, so it can be moved to another thread and run
+/// there while the replica carries on, which is the point: writing out a
+/// large store takes as long as reading all of it, and consensus should
+/// not stop for that. Hand the result to
+/// [`finish_snapshot`](ReplicatedStore::finish_snapshot).
+pub struct SnapshotJob<K: SnapshotSink> {
+    view: StoreView,
+    sink: K,
+}
+
+impl<K: SnapshotSink> SnapshotJob<K> {
+    /// The index the snapshot covers.
+    pub fn index(&self) -> u64 {
+        self.sink.meta().index
+    }
+
+    /// Write the snapshot out. Needs no access to the replica.
+    pub fn run(self) -> Result<K> {
+        let SnapshotJob { view, mut sink } = self;
+        write_snapshot(&view, &mut sink)?;
+        sink.flush()?;
+        Ok(sink)
+    }
 }
 
 impl<S: Storage> ReplicatedStore<S> {
@@ -132,6 +173,8 @@ impl<S: Storage> ReplicatedStore<S> {
             store,
             applied,
             snapshot_every: DEFAULT_SNAPSHOT_EVERY,
+            background_snapshots: false,
+            snapshotting: false,
         };
         if replica.snapshot_index() > replica.applied {
             replica.restore()?;
@@ -143,6 +186,66 @@ impl<S: Storage> ReplicatedStore<S> {
     /// a snapshot. Zero turns snapshots off, and the log grows for ever.
     pub fn set_snapshot_every(&mut self, entries: u64) {
         self.snapshot_every = entries;
+    }
+
+    /// Stop taking snapshots inline, as part of applying, and leave it to
+    /// the caller to run [`start_snapshot`](Self::start_snapshot) and write
+    /// the job out wherever it likes. A server does this so that writing a
+    /// snapshot never holds the lock that consensus needs.
+    pub fn set_background_snapshots(&mut self, background: bool) {
+        self.background_snapshots = background;
+    }
+
+    /// Whether enough has been applied since the last snapshot to be worth
+    /// another, and none is being taken already.
+    pub fn snapshot_due(&self) -> bool {
+        self.snapshot_every != 0
+            && !self.snapshotting
+            && self.applied >= self.snapshot_index() + self.snapshot_every
+    }
+
+    /// Begin a snapshot of the store as it stands, if one is due.
+    ///
+    /// This is the cheap half: the store's index is copied and a sink is
+    /// opened. The expensive half is [`SnapshotJob::run`], which reads the
+    /// values, and nothing it reads can change underneath it, because
+    /// every write from here on appends somewhere new. Until the job is
+    /// finished or abandoned no other is started.
+    pub fn start_snapshot(&mut self) -> Result<Option<SnapshotJob<S::Sink>>> {
+        if !self.snapshot_due() {
+            return Ok(None);
+        }
+        let Some(sink) = self.node.begin_compaction(self.applied)? else {
+            return Ok(None);
+        };
+        // The store was synced up to `applied` as the last entry was
+        // applied, which matters: once the log is discarded, the snapshot
+        // and the store are the only record of it.
+        let view = self.store.view()?;
+        self.snapshotting = true;
+        Ok(Some(SnapshotJob { view, sink }))
+    }
+
+    /// Install a snapshot a job has written, and discard the log it covers.
+    ///
+    /// If the node installed a newer snapshot from its leader while the job
+    /// ran, this one is simply dropped.
+    pub fn finish_snapshot(&mut self, sink: S::Sink) -> Result<()> {
+        self.snapshotting = false;
+        if self.node.finish_compaction(sink)? {
+            // The store grows by an append for every write, and in a
+            // cluster nothing else ever compacts it. The moment the log is
+            // compacted is the natural moment to compact the store too.
+            if self.store.stats().fragmentation() > 0.5 {
+                self.store.compact()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Give up on a job that failed, so that another can be started.
+    pub fn abandon_snapshot(&mut self) {
+        self.snapshotting = false;
     }
 
     /// The last index covered by the node's current snapshot, or 0.
@@ -293,28 +396,10 @@ impl<S: Storage> ReplicatedStore<S> {
             write_applied(self.store.dir(), self.applied)?;
         }
 
-        self.maybe_snapshot()
-    }
-
-    /// Fold the applied log into a snapshot once enough of it has built up.
-    ///
-    /// The store has already been synced up to `applied` by the time this
-    /// runs, which matters: once the log is discarded, the snapshot and the
-    /// store are the only record of it.
-    fn maybe_snapshot(&mut self) -> Result<()> {
-        if self.snapshot_every == 0 {
-            return Ok(());
-        }
-        if self.applied < self.snapshot_index() + self.snapshot_every {
-            return Ok(());
-        }
-        let data = encode_snapshot(&self.store)?;
-        if self.node.compact(self.applied, &data)? {
-            // The store grows by an append for every write, and in a
-            // cluster nothing else ever compacts it. The moment the log is
-            // compacted is the natural moment to compact the store too.
-            if self.store.stats().fragmentation() > 0.5 {
-                self.store.compact()?;
+        if !self.background_snapshots {
+            if let Some(job) = self.start_snapshot()? {
+                let sink = job.run()?;
+                self.finish_snapshot(sink)?;
             }
         }
         Ok(())
@@ -332,32 +417,30 @@ impl<S: Storage> ReplicatedStore<S> {
     /// still ahead of the store, and the next start runs this again. Values
     /// already right are left alone, so running it twice does not grow the
     /// store twice.
+    ///
+    /// The snapshot is read as a stream, one record at a time, and walked
+    /// in step with the store's own keys in sorted order, so what is held
+    /// in memory is the store's key list and one value, not the snapshot.
     fn restore(&mut self) -> Result<()> {
         let index = self.snapshot_index();
-        let len = self.node.storage().snapshot_len();
-        let Ok(len) = usize::try_from(len) else {
-            return Err(Error::Corrupt {
-                file_id: 0,
-                offset: 0,
-                detail: "snapshot is larger than this machine can address",
-            });
-        };
-        let data = self.node.storage().read_snapshot(0, len)?;
-        let wanted = decode_snapshot(&data)?;
+        let mut keys: Vec<Vec<u8>> = self.store.keys().map(<[u8]>::to_vec).collect();
+        keys.sort_unstable();
+        let mut held = keys.into_iter().peekable();
 
-        let stale: Vec<Vec<u8>> = self
-            .store
-            .keys()
-            .filter(|key| !wanted.contains_key(*key))
-            .map(<[u8]>::to_vec)
-            .collect();
-        for key in stale {
-            self.store.delete(&key)?;
-        }
-        for (key, value) in &wanted {
-            if self.store.get(key)?.as_deref() != Some(value.as_slice()) {
-                self.store.put(key, value)?;
+        let mut records = SnapshotRecords::new(self.node.storage().snapshot_reader()?);
+        while let Some((key, value)) = records.next_record()? {
+            // Everything the store holds that sorts before this key is
+            // absent from the snapshot, which means the cluster deleted it.
+            while let Some(stale) = held.next_if(|k| *k < key) {
+                self.store.delete_deferred(&stale)?;
             }
+            held.next_if(|k| *k == key);
+            if self.store.get(&key)?.as_deref() != Some(value.as_slice()) {
+                self.store.put_deferred(&key, &value)?;
+            }
+        }
+        for stale in held {
+            self.store.delete_deferred(&stale)?;
         }
 
         self.store.sync()?;
@@ -367,62 +450,84 @@ impl<S: Storage> ReplicatedStore<S> {
 }
 
 /// The store's live contents as a snapshot: one record per key, in key
-/// order, so that two identical stores produce identical snapshots.
-///
-/// Built in memory, which is the price of simplicity here: taking or
-/// restoring a snapshot needs room for the store's whole contents at once.
-fn encode_snapshot(store: &Store) -> Result<Vec<u8>> {
-    let mut keys: Vec<&[u8]> = store.keys().collect();
-    keys.sort_unstable();
-    let mut out = Vec::new();
-    for key in keys {
-        let value = store.get(key)?.ok_or(Error::Corrupt {
-            file_id: 0,
-            offset: 0,
-            detail: "a key vanished while the snapshot was being taken",
-        })?;
+/// order, so that two identical stores produce identical snapshots, and so
+/// that a restore can walk it in step with the store's own sorted keys.
+fn write_snapshot(view: &StoreView, out: &mut impl Write) -> Result<()> {
+    view.for_each(|key, value| {
         // A timestamp of zero, so the bytes depend on the contents alone.
-        out.extend_from_slice(&record::encode(key, Some(&value), 0)?);
-    }
-    Ok(out)
+        out.write_all(&record::encode(key, Some(value), 0)?)?;
+        Ok(())
+    })
 }
 
-fn decode_snapshot(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
-    let corrupt = |offset: usize, detail| Error::Corrupt {
-        file_id: 0,
-        offset: offset as u64,
-        detail,
-    };
-    let mut out = HashMap::new();
-    let mut at = 0usize;
-    while at < data.len() {
-        if data.len() - at < HEADER_LEN {
-            return Err(corrupt(at, "snapshot ends inside a record header"));
+/// Reads a snapshot back one record at a time, checking each one.
+struct SnapshotRecords<R: Read> {
+    reader: R,
+    offset: u64,
+    previous: Option<Vec<u8>>,
+}
+
+impl<R: Read> SnapshotRecords<R> {
+    fn new(reader: R) -> Self {
+        SnapshotRecords {
+            reader,
+            offset: 0,
+            previous: None,
         }
-        let header = Header::decode(
-            data[at..at + HEADER_LEN]
-                .try_into()
-                .expect("checked length"),
-        );
-        let Ok(len) = usize::try_from(header.record_len()) else {
-            return Err(corrupt(at, "snapshot record is too large"));
+    }
+
+    /// The next key and value, or `None` at a clean end.
+    fn next_record(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let at = self.offset;
+        let corrupt = |detail| Error::Corrupt {
+            file_id: 0,
+            offset: at,
+            detail,
         };
-        if len > data.len() - at {
-            return Err(corrupt(at, "snapshot ends inside a record"));
+        let mut header = [0u8; HEADER_LEN];
+        match read_full(&mut self.reader, &mut header)? {
+            0 => return Ok(None),
+            HEADER_LEN => {}
+            _ => return Err(corrupt("snapshot ends inside a record header")),
         }
-        let key_end = at + HEADER_LEN + header.key_len as usize;
-        let key = &data[at + HEADER_LEN..key_end];
-        let value = &data[key_end..at + len];
-        if !header.verify(key, value) {
-            return Err(corrupt(at, "checksum mismatch in a snapshot record"));
+        let header = Header::decode(&header);
+        let mut key = vec![0u8; header.key_len as usize];
+        let mut value = vec![0u8; header.value_len as usize];
+        if read_full(&mut self.reader, &mut key)? < key.len()
+            || read_full(&mut self.reader, &mut value)? < value.len()
+        {
+            return Err(corrupt("snapshot ends inside a record"));
+        }
+        if !header.verify(&key, &value) {
+            return Err(corrupt("checksum mismatch in a snapshot record"));
         }
         if header.is_tombstone() {
-            return Err(corrupt(at, "a snapshot holds live keys, never deletions"));
+            return Err(corrupt("a snapshot holds live keys, never deletions"));
         }
-        out.insert(key.to_vec(), value.to_vec());
-        at += len;
+        // Order is what lets a restore find stale keys without holding the
+        // snapshot in memory, so a snapshot out of order is refused rather
+        // than half applied.
+        if self.previous.as_ref().is_some_and(|p| *p >= key) {
+            return Err(corrupt("snapshot keys are not in order"));
+        }
+        self.previous = Some(key.clone());
+        self.offset += header.record_len();
+        Ok(Some((key, value)))
     }
-    Ok(out)
+}
+
+/// Fill `buf` as far as the stream allows, and say how far that was.
+fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(filled)
 }
 
 /// The applied index, or 0 if there is none to be had.
@@ -456,6 +561,23 @@ fn write_applied(dir: &Path, index: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::StorageExt;
+    use std::io::Read;
+
+    fn encode_snapshot(store: &Store) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        write_snapshot(&store.view()?, &mut out)?;
+        Ok(out)
+    }
+
+    fn decode_snapshot(data: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut records = SnapshotRecords::new(data);
+        let mut out = Vec::new();
+        while let Some(pair) = records.next_record()? {
+            out.push(pair);
+        }
+        Ok(out)
+    }
 
     fn temp_store(label: &str) -> (std::path::PathBuf, Store) {
         let path = std::env::temp_dir().join(format!(
@@ -480,9 +602,7 @@ mod tests {
         store.delete(b"gone").unwrap();
         store.put(b"a", b"overwritten").unwrap();
 
-        let decoded = decode_snapshot(&encode_snapshot(&store).unwrap()).unwrap();
-        let mut pairs: Vec<_> = decoded.into_iter().collect();
-        pairs.sort();
+        let pairs = decode_snapshot(&encode_snapshot(&store).unwrap()).unwrap();
         assert_eq!(
             pairs,
             vec![
@@ -587,6 +707,124 @@ mod tests {
             before,
             "restoring identical contents rewrote them"
         );
+        drop(replica);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A restore walks the snapshot and the store's sorted keys in step.
+    /// Stale keys can sort before the first snapshot key, between two of
+    /// them, and after the last, and every one of them has to go.
+    #[test]
+    fn a_restore_deletes_stale_keys_wherever_they_sort() {
+        let (path, mut store) = temp_store("restore-merge");
+        for key in ["a", "c", "m", "x", "z"] {
+            store.put(key.as_bytes(), b"old").unwrap();
+        }
+        let (path2, mut source) = temp_store("restore-merge-source");
+        for key in ["b", "c", "n", "x"] {
+            source.put(key.as_bytes(), key.as_bytes()).unwrap();
+        }
+        let replica = restored(store, &encode_snapshot(&source).unwrap());
+
+        let mut keys: Vec<Vec<u8>> = replica.store().keys().map(<[u8]>::to_vec).collect();
+        keys.sort();
+        assert_eq!(keys, [&b"b"[..], b"c", b"n", b"x"]);
+        for key in ["b", "c", "n", "x"] {
+            assert_eq!(
+                replica.get(key.as_bytes()).unwrap().as_deref(),
+                Some(key.as_bytes())
+            );
+        }
+        drop((replica, source));
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_dir_all(&path2);
+    }
+
+    /// Order is what the restore relies on to find stale keys, so a
+    /// snapshot out of order is refused rather than half believed.
+    #[test]
+    fn a_snapshot_out_of_order_is_refused() {
+        let mut data = record::encode(b"b", Some(b"2"), 0).unwrap();
+        data.extend_from_slice(&record::encode(b"a", Some(b"1"), 0).unwrap());
+        assert!(matches!(decode_snapshot(&data), Err(Error::Corrupt { .. })));
+        let mut twice = record::encode(b"a", Some(b"1"), 0).unwrap();
+        twice.extend_from_slice(&record::encode(b"a", Some(b"1"), 0).unwrap());
+        assert!(matches!(
+            decode_snapshot(&twice),
+            Err(Error::Corrupt { .. })
+        ));
+    }
+
+    /// A one-node replica in office, with its no-op applied.
+    fn single_node(store: Store) -> ReplicatedStore<crate::raft::MemStorage> {
+        use crate::raft::{Config, MemStorage};
+        let node = Node::new(1, vec![1], Config::default(), MemStorage::new());
+        let mut replica = ReplicatedStore::new(node, store).unwrap();
+        while !replica.ready_to_serve() {
+            replica.tick().unwrap();
+        }
+        replica.tick().unwrap();
+        replica
+    }
+
+    fn put_and_apply(
+        replica: &mut ReplicatedStore<crate::raft::MemStorage>,
+        key: &str,
+        value: &str,
+    ) {
+        replica.put(key.as_bytes(), value.as_bytes()).unwrap();
+        replica.tick().unwrap();
+    }
+
+    /// The point of a job is that the replica carries on while it runs, so
+    /// what it writes has to be the store as of its index, not the store as
+    /// it has become by the time each value is read.
+    #[test]
+    fn a_background_snapshot_is_the_store_as_of_its_index() {
+        let (path, store) = temp_store("background");
+        let mut replica = single_node(store);
+        replica.set_background_snapshots(true);
+        replica.set_snapshot_every(3);
+
+        for (k, v) in [("a", "1"), ("b", "2"), ("c", "3")] {
+            put_and_apply(&mut replica, k, v);
+        }
+        assert!(replica.snapshot_due());
+        assert_eq!(replica.snapshot_index(), 0, "inline snapshots are off");
+        let job = replica.start_snapshot().unwrap().expect("one is due");
+        let index = job.index();
+        assert_eq!(index, replica.applied_index());
+        assert!(!replica.snapshot_due(), "one is already being taken");
+
+        // The replica moves on underneath the job.
+        put_and_apply(&mut replica, "a", "overwritten");
+        replica.delete(b"b").unwrap();
+        replica.tick().unwrap();
+        put_and_apply(&mut replica, "d", "new");
+
+        let sink = job.run().unwrap();
+        replica.finish_snapshot(sink).unwrap();
+        assert_eq!(replica.snapshot_index(), index);
+
+        let mut data = Vec::new();
+        replica
+            .node()
+            .storage()
+            .snapshot_reader()
+            .unwrap()
+            .read_to_end(&mut data)
+            .unwrap();
+        assert_eq!(
+            decode_snapshot(&data).unwrap(),
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+            ]
+        );
+        // And the store itself has carried on regardless.
+        assert_eq!(replica.get(b"a").unwrap(), Some(b"overwritten".to_vec()));
+        assert_eq!(replica.get(b"b").unwrap(), None);
         drop(replica);
         let _ = std::fs::remove_dir_all(&path);
     }
