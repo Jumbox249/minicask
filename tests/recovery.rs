@@ -113,11 +113,33 @@ fn corruption_in_a_sealed_file_is_reported() {
     assert!(files.len() > 1, "expected the store to roll over");
     corrupt_byte(&files[0], 25);
 
-    match Store::open(dir.path()) {
+    // Checked at open, the damage stops the store opening.
+    let verify = Options {
+        verify_on_open: true,
+        ..Options::default()
+    };
+    match Store::open_with(dir.path(), verify) {
         Err(Error::Corrupt { file_id, .. }) => assert_eq!(file_id, 1),
         Err(other) => panic!("expected a corruption error, got: {other}"),
         Ok(_) => panic!("expected a corruption error, but the store opened cleanly"),
     }
+
+    // Opened from its hint, the file is not read at open, so the damage is
+    // found when the damaged record is: reported, never handed back.
+    let store = Store::open(dir.path()).unwrap();
+    assert!(
+        matches!(store.get(b"key-0"), Err(Error::Corrupt { file_id: 1, .. })),
+        "a damaged record in a hinted file was not reported on read"
+    );
+    assert_eq!(store.get(b"key-39").unwrap(), Some(b"value-39".to_vec()));
+    drop(store);
+
+    // And without its hint, the file is scanned and refused as before.
+    std::fs::remove_file(files[0].with_extension("hint")).unwrap();
+    assert!(matches!(
+        Store::open(dir.path()),
+        Err(Error::Corrupt { file_id: 1, .. })
+    ));
 }
 
 /// Bit rot under a live store is caught on read rather than handed back as

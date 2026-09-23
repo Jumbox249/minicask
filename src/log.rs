@@ -4,7 +4,7 @@
 use crate::error::Result;
 use crate::record::{Header, HEADER_LEN};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// How hard the store tries to get bytes onto the physical disk.
@@ -232,11 +232,14 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    pub fn open(dir: &Path, file_id: u64) -> Result<Self> {
-        let file = File::open(data_file_path(dir, file_id))?;
+    /// Scan from `offset`, which must be where a record starts: the start
+    /// of the file, or the end of what a hint already describes.
+    pub fn open_at(dir: &Path, file_id: u64, offset: u64) -> Result<Self> {
+        let mut file = File::open(data_file_path(dir, file_id))?;
+        file.seek(SeekFrom::Start(offset))?;
         Ok(Scanner {
             reader: BufReader::with_capacity(64 * 1024, file),
-            offset: 0,
+            offset,
         })
     }
 

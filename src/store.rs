@@ -1,6 +1,7 @@
 //! The store itself: an in-memory index over a set of append-only files.
 
 use crate::error::{Error, Result};
+use crate::hint::{self, HintEntry};
 use crate::log::{
     self, data_file_path, list_data_files, LogWriter, Reach, ScanOutcome, Scanner, SyncPolicy,
 };
@@ -26,6 +27,15 @@ pub struct Options {
     pub sync: SyncPolicy,
     /// Roll over to a new data file once the active one passes this size.
     pub max_file_bytes: u64,
+    /// Scan every record of every data file at open, checking each one's
+    /// checksum, instead of reading the index from hint files.
+    ///
+    /// Opening from hints reads a few bytes per record rather than every
+    /// value, but it does not check the values, so rot in a file with a
+    /// hint is found when that record is read rather than at open. It is
+    /// found either way: every read checks its record. This is for when
+    /// finding it at open matters more than opening quickly.
+    pub verify_on_open: bool,
 }
 
 impl Default for Options {
@@ -33,6 +43,7 @@ impl Default for Options {
         Options {
             sync: SyncPolicy::EveryWrite,
             max_file_bytes: 64 * 1024 * 1024,
+            verify_on_open: false,
         }
     }
 }
@@ -96,6 +107,11 @@ pub struct Store {
     /// sealed. Sealing syncs, so this is all of it; it is kept so that
     /// [`simulate_power_cut`](Store::simulate_power_cut) can tell.
     sealed_synced: HashMap<u64, u64>,
+    /// Every record in the active file, as its hint will hold them once it
+    /// is sealed. Keys only, no values, so it costs what the index does.
+    active_hints: Vec<HintEntry>,
+    /// Bytes of data files read at open, which the hints exist to keep low.
+    scanned_at_open: u64,
 }
 
 impl Store {
@@ -106,6 +122,11 @@ impl Store {
 
     /// Open (or create) a store, replaying every data file to rebuild the
     /// index.
+    ///
+    /// A data file with a hint is read from the hint instead, as far as the
+    /// hint goes, and only what was appended after it is scanned. See
+    /// [`crate::hint`]. A sealed file found without one gets one written,
+    /// so the next open does not scan it again.
     ///
     /// If the newest file ends in a half-written record, which is what a
     /// crash mid-append leaves behind, the partial tail is truncated away and
@@ -118,48 +139,94 @@ impl Store {
         let file_ids = list_data_files(&dir)?;
         let newest = file_ids.last().copied();
 
+        // A hint whose data file is gone was left by a crash in the middle
+        // of deleting what a compaction replaced.
+        for id in hint::list(&dir)? {
+            if !file_ids.contains(&id) {
+                std::fs::remove_file(hint::hint_path(&dir, id))?;
+            }
+        }
+
         let mut keydir: HashMap<Vec<u8>, Location> = HashMap::new();
         let mut readers = HashMap::new();
         let mut live_bytes = 0u64;
         let mut disk_bytes = 0u64;
+        let mut active_hints = Vec::new();
+        let mut scanned_at_open = 0u64;
 
         for &file_id in &file_ids {
-            let mut scanner = Scanner::open(&dir, file_id)?;
-            loop {
-                match scanner.next_record()? {
-                    ScanOutcome::Record(rec) => {
-                        disk_bytes += rec.len as u64;
-                        if let Some(old) = keydir.remove(&rec.key) {
-                            live_bytes -= old.len as u64;
-                        }
-                        if !rec.header.is_tombstone() {
-                            live_bytes += rec.len as u64;
-                            keydir.insert(
-                                rec.key,
-                                Location {
+            let is_newest = Some(file_id) == newest;
+            let file_len = std::fs::metadata(data_file_path(&dir, file_id))?.len();
+            let (mut entries, hinted) = if opts.verify_on_open {
+                (Vec::new(), 0)
+            } else {
+                hint::load(&dir, file_id, file_len).unwrap_or_default()
+            };
+
+            if hinted < file_len {
+                scanned_at_open += file_len - hinted;
+                let mut scanner = Scanner::open_at(&dir, file_id, hinted)?;
+                loop {
+                    match scanner.next_record()? {
+                        ScanOutcome::Record(rec) => entries.push(HintEntry {
+                            key: rec.key,
+                            offset: rec.offset,
+                            len: rec.len,
+                            tstamp: rec.header.tstamp,
+                            tombstone: rec.header.is_tombstone(),
+                        }),
+                        ScanOutcome::Eof => break,
+                        ScanOutcome::Torn { offset, detail } => {
+                            // Only the file that was being appended to can
+                            // end mid-record. Anything else means real damage.
+                            if !is_newest {
+                                return Err(Error::Corrupt {
                                     file_id,
-                                    offset: rec.offset,
-                                    len: rec.len,
-                                    tstamp: rec.header.tstamp,
-                                },
-                            );
+                                    offset,
+                                    detail,
+                                });
+                            }
+                            truncate_at(&dir, file_id, offset)?;
+                            break;
                         }
-                    }
-                    ScanOutcome::Eof => break,
-                    ScanOutcome::Torn { offset, detail } => {
-                        // Only the file that was being appended to can end
-                        // mid-record. Anything else means real damage.
-                        if Some(file_id) != newest {
-                            return Err(Error::Corrupt {
-                                file_id,
-                                offset,
-                                detail,
-                            });
-                        }
-                        truncate_at(&dir, file_id, offset)?;
-                        break;
                     }
                 }
+                if !is_newest {
+                    // Sealed, so it will not change again. The hint must
+                    // not describe bytes the disk might yet lose, so the
+                    // file is synced first; it almost always is already.
+                    // A hint only saves work, so failing to write one is
+                    // no reason to fail to open.
+                    // Opened for appending, since Windows will not flush a
+                    // handle that cannot write.
+                    OpenOptions::new()
+                        .append(true)
+                        .open(data_file_path(&dir, file_id))?
+                        .sync_all()?;
+                    let _ = hint::write(&dir, file_id, file_len, &entries);
+                }
+            }
+
+            for entry in &entries {
+                disk_bytes += entry.len as u64;
+                if let Some(old) = keydir.remove(&entry.key) {
+                    live_bytes -= old.len as u64;
+                }
+                if !entry.tombstone {
+                    live_bytes += entry.len as u64;
+                    keydir.insert(
+                        entry.key.clone(),
+                        Location {
+                            file_id,
+                            offset: entry.offset,
+                            len: entry.len,
+                            tstamp: entry.tstamp,
+                        },
+                    );
+                }
+            }
+            if is_newest {
+                active_hints = entries;
             }
             readers.insert(file_id, File::open(data_file_path(&dir, file_id))?);
         }
@@ -179,7 +246,16 @@ impl Store {
             live_bytes,
             disk_bytes,
             sealed_synced: HashMap::new(),
+            active_hints,
+            scanned_at_open,
         })
+    }
+
+    /// How many bytes of data files had to be read at open because no hint
+    /// covered them. For the tests of the hints.
+    #[doc(hidden)]
+    pub fn bytes_scanned_at_open(&self) -> u64 {
+        self.scanned_at_open
     }
 
     pub fn options(&self) -> Options {
@@ -289,6 +365,14 @@ impl Store {
         let bytes = record::encode(key, Some(value), record::now_millis())?;
         self.roll_if_needed(bytes.len() as u64)?;
         let (offset, len) = self.writer.append(&bytes, reach)?;
+        let tstamp = record::now_millis();
+        self.active_hints.push(HintEntry {
+            key: key.to_vec(),
+            offset,
+            len,
+            tstamp,
+            tombstone: false,
+        });
 
         self.disk_bytes += len as u64;
         if let Some(old) = self.keydir.remove(key) {
@@ -301,7 +385,7 @@ impl Store {
                 file_id: self.writer.file_id,
                 offset,
                 len,
-                tstamp: record::now_millis(),
+                tstamp,
             },
         );
         Ok(())
@@ -343,7 +427,14 @@ impl Store {
         }
         let bytes = record::encode(key, None, record::now_millis())?;
         self.roll_if_needed(bytes.len() as u64)?;
-        let (_, len) = self.writer.append(&bytes, reach)?;
+        let (offset, len) = self.writer.append(&bytes, reach)?;
+        self.active_hints.push(HintEntry {
+            key: key.to_vec(),
+            offset,
+            len,
+            tstamp: record::now_millis(),
+            tombstone: true,
+        });
 
         self.disk_bytes += len as u64;
         if let Some(old) = self.keydir.remove(key) {
@@ -412,6 +503,7 @@ impl Store {
         // any of the originals are unlinked.
         let mut writer = LogWriter::open(&self.dir, merged_id)?;
         let mut merged: HashMap<Vec<u8>, Location> = HashMap::with_capacity(entries.len());
+        let mut merged_hints = Vec::with_capacity(entries.len());
         let mut merged_bytes = 0u64;
 
         for (key, loc) in entries {
@@ -425,6 +517,13 @@ impl Store {
             let bytes = log::read_at(file, loc.offset, loc.len)?;
             let (offset, len) = writer.append(&bytes, Reach::Buffer)?;
             merged_bytes += len as u64;
+            merged_hints.push(HintEntry {
+                key: key.clone(),
+                offset,
+                len,
+                tstamp: loc.tstamp,
+                tombstone: false,
+            });
             merged.insert(
                 key,
                 Location {
@@ -436,11 +535,21 @@ impl Store {
             );
         }
         writer.sync()?;
+        // The merged file carries on as the active file, and its hint
+        // covers what is in it so far: the next open reads the hint and
+        // scans only what is appended after this.
+        let _ = hint::write(&self.dir, merged_id, writer.offset, &merged_hints);
 
         // The merged file is durable now, so the originals are safe to drop.
+        // Each hint goes before its data file, so a crash between the two
+        // leaves a data file without a hint rather than the reverse.
         for id in &old_ids {
             self.readers.remove(id);
             self.sealed_synced.remove(id);
+            let hint = hint::hint_path(&self.dir, *id);
+            if hint.exists() {
+                std::fs::remove_file(hint)?;
+            }
             let path = data_file_path(&self.dir, *id);
             if path.exists() {
                 std::fs::remove_file(path)?;
@@ -450,6 +559,7 @@ impl Store {
         self.readers
             .insert(merged_id, File::open(data_file_path(&self.dir, merged_id))?);
         self.keydir = merged;
+        self.active_hints = merged_hints;
         self.writer = writer;
         self.live_bytes = merged_bytes;
         self.disk_bytes = merged_bytes;
@@ -501,6 +611,10 @@ impl Store {
         self.writer.sync()?;
         self.sealed_synced
             .insert(self.writer.file_id, self.writer.synced);
+        // The file is sealed and synced, so its hint can be written. Best
+        // effort: without one the next open scans the file, nothing worse.
+        let hints = std::mem::take(&mut self.active_hints);
+        let _ = hint::write(&self.dir, self.writer.file_id, self.writer.offset, &hints);
         let next_id = self.writer.file_id + 1;
         self.writer = LogWriter::open(&self.dir, next_id)?;
         self.readers

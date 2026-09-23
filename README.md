@@ -34,7 +34,9 @@ One directory, a set of numbered data files, and the newest one is the only one 
 ```
 my-data/
   0000000001.log   sealed
+  0000000001.hint  its index: each record's key, offset, length and timestamp
   0000000002.log   sealed
+  0000000002.hint
   0000000003.log   active, appends land here
 ```
 
@@ -63,6 +65,12 @@ A delete appends a tombstone rather than erasing anything, which is what keeps t
 The distinction the last two rows draw is deliberate. Losing the newest writes is a durability choice you opt into for speed. Returning a value that is not what was written is a correctness bug, and no policy enables it.
 
 A torn tail is only accepted on the newest file, since that is the only one that could have been mid-append. Damage anywhere else is real corruption and is reported instead of being quietly discarded.
+
+## Hint files
+
+Rebuilding the index means reading every data file, and without help that means every byte of every value, so startup time grows with the data rather than with the number of keys. A hint file is a data file's index: for each record, its key, where it is, how long it is, its timestamp and whether it is a tombstone, and none of the value. It is written when a file is sealed, and after a compaction for the merged file, so opening a store reads the hints and skips the values.
+
+A hint describes a prefix of its data file, a stated number of bytes of it. Data files only grow, so a prefix stays true, and whatever was appended after the hint was written is scanned as before. That one rule covers a sealed file, whose hint is the whole of it, and a freshly compacted file, which is still the active one and keeps growing. A hint is only written for bytes already synced, and written beside its data file and renamed into place, so it is never ahead of the data. One that is damaged, describes more than the file holds, or does not tile the file record by record is ignored and the file scanned, never an error, since a hint only ever saves work. A sealed file found without one gets one written, so upgrading a store costs one ordinary open. How much a hint saves depends on how big the values are, since values are what it skips: with the benchmark's 100-byte values, opening 200,000 records went from 1.8 to 2.75 million records a second, and building the index is most of what is left.
 
 ## Compaction
 
@@ -308,7 +316,7 @@ $ cargo test
 196 tests, including the three that matter:
 
 - **`a_killed_writer_loses_nothing_it_finished`** spawns a real child process that writes 500 records, scribbles a header with no body onto the end of the file, then calls `abort()`. No destructor runs, no buffer is flushed, the kernel takes the process out with `SIGABRT`. The test then reopens the store and checks all 500 records, and that it is still writable afterwards.
-- **`corruption_in_a_sealed_file_is_reported`** flips a bit in a file that was already closed and asserts the store refuses to open rather than pretending.
+- **`corruption_in_a_sealed_file_is_reported`** flips a bit in a file that was already closed and asserts the store refuses to open rather than pretending when asked to verify at open, and that opened from the file's hint it reports the damaged record when it is read, never handing it back.
 - **`deleted_keys_do_not_come_back_after_a_compaction`** guards the ordering rule that makes compaction safe.
 
 `tests/raft.rs` is a deterministic cluster harness, described above. `tests/replicated.rs` runs three replicas on real files through partitions, leader kills and restarts, checking after every round that no two of them hold different data. `tests/cluster.rs` starts three actual `minicask-cluster` processes and does it over TCP. `tests/server.rs` starts the real `minicask-server` binary and talks to it over a socket: pipelining, inline commands, binary-safe values, eight clients writing at once, a protocol error that must not affect other connections, and a `kill` followed by a restart on the same directory.
@@ -335,7 +343,7 @@ Worth being straight about, since each of these is a design choice rather than a
 - **Keys must fit in memory.** The index is a `HashMap`, so memory scales with key count, not data size.
 - **Single process.** There is no file lock. Two `Store` instances on one directory will corrupt each other. Within one process, reads can share a `Store` across threads and writes need it alone, which is what the server's read-write lock is for.
 - **One store is still one disk.** `minicask-cluster` is the answer to that, and it is a different set of trade-offs rather than a strictly better one: every write costs a network round trip and a majority of fsyncs.
-- **Startup reads every byte.** Recovery verifies the checksum of each record, which means replay is proportional to data size rather than key count. Bitcask solves this with hint files, which would be the next thing to build.
+- **A hint is trusted, not checked.** Opening from a hint does not verify each record's checksum the way a scan does, so rot inside a hinted file is found when the value is read rather than at startup. It is still found: every read checks its record.
 - **Compaction is stop-the-world.** It blocks until the merge finishes.
 - **No range scans.** A hash index cannot answer ordered queries.
 

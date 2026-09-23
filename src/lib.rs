@@ -23,6 +23,7 @@
 mod cluster;
 mod crc;
 mod error;
+mod hint;
 mod log;
 pub mod raft;
 mod record;
