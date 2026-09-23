@@ -207,29 +207,7 @@ impl Store {
         let Some(loc) = self.keydir.get(key) else {
             return Ok(None);
         };
-        let file = self.readers.get(&loc.file_id).ok_or(Error::Corrupt {
-            file_id: loc.file_id,
-            offset: loc.offset,
-            detail: "index points at a data file that is not open",
-        })?;
-
-        let bytes = log::read_at(file, loc.offset, loc.len)?;
-        let header =
-            record::Header::decode(bytes[..HEADER_LEN].try_into().map_err(|_| Error::Corrupt {
-                file_id: loc.file_id,
-                offset: loc.offset,
-                detail: "record shorter than a header",
-            })?);
-        let key_end = HEADER_LEN + header.key_len as usize;
-        let value = bytes[key_end..].to_vec();
-        if !header.verify(&bytes[HEADER_LEN..key_end], &value) {
-            return Err(Error::Corrupt {
-                file_id: loc.file_id,
-                offset: loc.offset,
-                detail: "checksum mismatch on read",
-            });
-        }
-        Ok(Some(value))
+        read_value(&self.readers, loc).map(Some)
     }
 
     /// Remove a key. Returns whether it was there to begin with.
@@ -368,6 +346,39 @@ impl Store {
             .insert(next_id, File::open(data_file_path(&self.dir, next_id))?);
         Ok(())
     }
+}
+
+/// Read and verify the value a location points at.
+///
+/// The index was built from records that passed their checksums, but the
+/// bytes can have changed on disk since. A header that no longer describes
+/// the record it heads is reported as corruption, never trusted to slice
+/// with.
+fn read_value(readers: &HashMap<u64, File>, loc: &Location) -> Result<Vec<u8>> {
+    let corrupt = |detail| Error::Corrupt {
+        file_id: loc.file_id,
+        offset: loc.offset,
+        detail,
+    };
+    let file = readers
+        .get(&loc.file_id)
+        .ok_or(corrupt("index points at a data file that is not open"))?;
+
+    let bytes = log::read_at(file, loc.offset, loc.len)?;
+    let header_bytes: &[u8; HEADER_LEN] = bytes
+        .get(..HEADER_LEN)
+        .and_then(|h| h.try_into().ok())
+        .ok_or(corrupt("record shorter than a header"))?;
+    let header = record::Header::decode(header_bytes);
+    if header.record_len() != bytes.len() as u64 {
+        return Err(corrupt("record header does not match its length"));
+    }
+    let key_end = HEADER_LEN + header.key_len as usize;
+    let value = bytes[key_end..].to_vec();
+    if !header.verify(&bytes[HEADER_LEN..key_end], &value) {
+        return Err(corrupt("checksum mismatch on read"));
+    }
+    Ok(value)
 }
 
 /// Cut a half-written record off the end of a data file.

@@ -142,6 +142,26 @@ fn a_flipped_bit_is_caught_on_read() {
     }
 }
 
+/// Rot in a header is worse than rot in a value: the lengths it holds are
+/// what the rest of the record is sliced by. A read must report it, not
+/// panic slicing past the end of what it read.
+#[test]
+fn a_damaged_header_is_reported_on_read_not_trusted() {
+    let dir = TempDir::new("header-rot");
+    let mut store = Store::open(dir.path()).unwrap();
+    store.put(b"alpha", b"untouched").unwrap();
+    store.sync().unwrap();
+
+    // Byte 15 is the top byte of the key length.
+    let active = dir.data_files().pop().unwrap();
+    corrupt_byte(&active, 15);
+
+    assert!(
+        matches!(store.get(b"alpha"), Err(Error::Corrupt { .. })),
+        "a record whose header no longer fits it was not reported"
+    );
+}
+
 /// An empty directory is a valid, empty store.
 #[test]
 fn a_fresh_directory_opens_clean() {

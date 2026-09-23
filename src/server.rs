@@ -1,10 +1,10 @@
 //! A TCP server that speaks the Redis protocol over the store, so that
 //! `redis-cli` and any Redis client library can use it.
 //!
-//! The store is single-threaded by design, so the server keeps it behind a
-//! mutex and each connection gets a thread. That is the simplest thing that
-//! is correct: a command holds the lock for one append or one read, and the
-//! store never sees two writers.
+//! Each connection gets a thread, and the store sits behind a read-write
+//! lock. Reads share it: a read is a hash lookup and a positional read of
+//! the file, and neither touches anything another reader could disturb.
+//! Writes take it alone, so the store never sees two writers.
 //!
 //! ```no_run
 //! use minicask::{Server, Store};
@@ -19,12 +19,12 @@ use crate::resp::{self, Reply};
 use crate::store::Store;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 
 pub struct Server {
     listener: TcpListener,
-    store: Arc<Mutex<Store>>,
+    store: Arc<RwLock<Store>>,
 }
 
 impl Server {
@@ -33,7 +33,7 @@ impl Server {
     pub fn bind<A: ToSocketAddrs>(addr: A, store: Store) -> io::Result<Server> {
         Ok(Server {
             listener: TcpListener::bind(addr)?,
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(RwLock::new(store)),
         })
     }
 
@@ -58,7 +58,7 @@ impl Server {
     }
 }
 
-fn serve(stream: TcpStream, store: &Mutex<Store>) -> io::Result<()> {
+fn serve(stream: TcpStream, store: &RwLock<Store>) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
@@ -96,15 +96,22 @@ fn serve(stream: TcpStream, store: &Mutex<Store>) -> io::Result<()> {
     }
 }
 
-/// Run one command against the store.
-fn dispatch(store: &Mutex<Store>, args: &[Vec<u8>]) -> Reply {
+// A poisoned lock means a handler panicked mid-command. The store's own
+// invariants hold regardless, since it never leaves a write half done in
+// memory, so carry on rather than taking every client down.
+fn shared(store: &RwLock<Store>) -> RwLockReadGuard<'_, Store> {
+    store.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn exclusive(store: &RwLock<Store>) -> RwLockWriteGuard<'_, Store> {
+    store.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run one command against the store, under a shared lock for a read and
+/// an exclusive one for a write.
+fn dispatch(store: &RwLock<Store>, args: &[Vec<u8>]) -> Reply {
     let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
     let args = &args[1..];
-
-    // A poisoned lock means a handler panicked mid-command. The store's own
-    // invariants hold regardless, since it never leaves a write half done
-    // in memory, so carry on rather than taking every client down.
-    let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
 
     let result: crate::Result<Reply> = match name.as_str() {
         "PING" => Ok(match args {
@@ -117,41 +124,55 @@ fn dispatch(store: &Mutex<Store>, args: &[Vec<u8>]) -> Reply {
             _ => return wrong_arity(&name),
         },
         "GET" => match args {
-            [key] => store.get(key).map(bulk_or_null),
+            [key] => shared(store).get(key).map(bulk_or_null),
             _ => return wrong_arity(&name),
         },
         "SET" => match args {
-            [key, value, options @ ..] => set(&mut store, key, value, options),
+            [key, value, options @ ..] => set(&mut exclusive(store), key, value, options),
             _ => return wrong_arity(&name),
         },
         "DEL" => match args {
             [] => return wrong_arity(&name),
-            keys => count(keys.iter().map(|k| store.delete(k))),
+            keys => {
+                let mut store = exclusive(store);
+                count(keys.iter().map(|k| store.delete(k)))
+            }
         },
         "EXISTS" => match args {
             [] => return wrong_arity(&name),
-            keys => Ok(Reply::Integer(
-                keys.iter().filter(|k| store.contains_key(k)).count() as i64,
-            )),
+            keys => {
+                let store = shared(store);
+                Ok(Reply::Integer(
+                    keys.iter().filter(|k| store.contains_key(k)).count() as i64,
+                ))
+            }
         },
         "MGET" => match args {
             [] => return wrong_arity(&name),
-            keys => keys
-                .iter()
-                .map(|k| store.get(k).map(bulk_or_null))
-                .collect::<crate::Result<Vec<_>>>()
-                .map(Reply::Array),
+            keys => {
+                // One guard for the lot, so the values come from one
+                // moment rather than from between two writes.
+                let store = shared(store);
+                keys.iter()
+                    .map(|k| store.get(k).map(bulk_or_null))
+                    .collect::<crate::Result<Vec<_>>>()
+                    .map(Reply::Array)
+            }
         },
         "MSET" => match args {
             [] => return wrong_arity(&name),
             pairs if pairs.len() % 2 != 0 => return wrong_arity(&name),
-            pairs => pairs
-                .chunks(2)
-                .try_for_each(|pair| store.put(&pair[0], &pair[1]))
-                .map(|()| Reply::ok()),
+            pairs => {
+                let mut store = exclusive(store);
+                pairs
+                    .chunks(2)
+                    .try_for_each(|pair| store.put(&pair[0], &pair[1]))
+                    .map(|()| Reply::ok())
+            }
         },
         "KEYS" => match args {
             [pattern] => {
+                let store = shared(store);
                 let mut keys: Vec<&[u8]> =
                     store.keys().filter(|k| glob_match(pattern, k)).collect();
                 keys.sort_unstable();
@@ -162,10 +183,11 @@ fn dispatch(store: &Mutex<Store>, args: &[Vec<u8>]) -> Reply {
             _ => return wrong_arity(&name),
         },
         "DBSIZE" => match args {
-            [] => Ok(Reply::Integer(store.len() as i64)),
+            [] => Ok(Reply::Integer(shared(store).len() as i64)),
             _ => return wrong_arity(&name),
         },
         "FLUSHDB" | "FLUSHALL" => {
+            let mut store = exclusive(store);
             let keys: Vec<Vec<u8>> = store.keys().map(<[u8]>::to_vec).collect();
             keys.iter()
                 .try_for_each(|k| store.delete(k).map(|_| ()))

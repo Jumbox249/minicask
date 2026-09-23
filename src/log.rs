@@ -4,7 +4,7 @@
 use crate::error::Result;
 use crate::record::{Header, HEADER_LEN};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// How hard the store tries to get bytes onto the physical disk.
@@ -203,12 +203,47 @@ impl Scanner {
 }
 
 /// Reads one record's bytes out of a data file that is already open.
+///
+/// A positional read, never a seek followed by a read. The two-step version
+/// moves a cursor that every reader of the handle shares, so two threads
+/// reading at once could each land on the other's offset. Reading at an
+/// explicit offset leaves nothing shared, which is what lets the store
+/// answer reads from several threads behind a read lock.
 pub fn read_at(file: &File, offset: u64, len: u32) -> Result<Vec<u8>> {
-    let mut handle = file;
-    handle.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0u8; len as usize];
-    handle.read_exact(&mut buf)?;
+    read_exact_at(file, &mut buf, offset)?;
     Ok(buf)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+/// Windows has no `read_exact_at`, only `seek_read`, which may return
+/// short. It does move the handle's cursor, but it reads from the offset it
+/// is given rather than from the cursor, so concurrent calls do not
+/// interfere.
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "data file ends before the record does",
+                ))
+            }
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Like `read_exact`, but reports a short read instead of failing, so the

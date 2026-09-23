@@ -142,3 +142,29 @@ fn keys_lists_only_live_entries() {
     keys.sort();
     assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
 }
+
+/// Reads share the store. Every value here is a different length, so a
+/// read that landed on another thread's offset would come back as the
+/// wrong bytes or fail its checksum rather than pass by coincidence.
+#[test]
+fn concurrent_reads_each_get_their_own_value() {
+    let dir = TempDir::new("concurrent-reads");
+    let mut store = Store::open(dir.path()).unwrap();
+    let value = |i: usize| vec![(i % 251) as u8; 100 + i * 7];
+    for i in 0..200 {
+        store.put(format!("key-{i}").as_bytes(), &value(i)).unwrap();
+    }
+
+    let store = &store;
+    std::thread::scope(|scope| {
+        for t in 0..8 {
+            scope.spawn(move || {
+                for round in 0..50 {
+                    let i = (t * 37 + round * 13) % 200;
+                    let got = store.get(format!("key-{i}").as_bytes()).unwrap();
+                    assert_eq!(got, Some(value(i)), "thread {t} read key-{i}");
+                }
+            });
+        }
+    });
+}
